@@ -33,6 +33,10 @@ If Atlantis loses that data in between a `plan` and `apply` cycle, then users wi
 to re-run `plan`. Because of this, you may want to provision a persistent disk
 for Atlantis.
 
+If you want to run more than one Atlantis replica for high availability or
+horizontal scale, see [High Availability](high-availability.md) for a
+reference architecture, migration plan, and known caveats.
+
 ## Deployment
 
 Pick your deployment type:

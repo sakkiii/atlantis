@@ -20,6 +20,8 @@ However, if you were to lose the data, all you would need to do is run `atlantis
 
 For fully stateless HA (no shared filesystem or persistent volume), Atlantis supports external plan storage via `--enable-external-stores` with an S3-compatible backend. Plans are uploaded to S3 after `terraform plan` and restored automatically when a different replica handles the `apply`. Combined with Redis for locking (`--locking-db-type=redis`), this allows running multiple Atlantis replicas with `emptyDir` volumes. See [server configuration](server-configuration.md) for details.
 
+For a full reference architecture, rollout plan, and known caveats (log streaming, drift status) when running multiple replicas, see [High Availability](high-availability.md).
+
 **Q: How to add SSL to Atlantis server?**
 
 A: First, you'll need to get a public/private key pair to serve over SSL.

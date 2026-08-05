@@ -46,6 +46,7 @@ const en = [
           { text: "Terraform Cloud", link: "/docs/terraform-cloud" },
           { text: "Sending Notifications via Webhooks", link: "/docs/sending-notifications-via-webhooks" },
           { text: "Stats", link: "/docs/stats" },
+          { text: "High Availability", link: "/docs/high-availability" },
           { text: "FAQ", link: "/docs/faq" },
         ]
       },
