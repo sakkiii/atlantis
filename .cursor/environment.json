@@ -1,0 +1,4 @@
+{
+  "name": "Atlantis",
+  "install": "bash .cursor/install.sh"
+}
