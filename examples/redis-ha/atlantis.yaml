@@ -1,0 +1,219 @@
+# Example only. Replace placeholders, Redis DNS, storage class, and ingress labels.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: atlantis
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: atlantis-ha
+  namespace: atlantis
+type: Opaque
+stringData:
+  internal-command-token: replace-with-at-least-32-random-bytes
+  redis-username: atlantis
+  redis-password: replace-with-redis-password
+  github-token: replace-with-github-token
+  github-webhook-secret: replace-with-webhook-secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: atlantis-headless
+  namespace: atlantis
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: atlantis
+  ports:
+  - name: http
+    port: 4141
+    targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: atlantis
+  namespace: atlantis
+spec:
+  type: ClusterIP
+  sessionAffinity: None
+  selector:
+    app.kubernetes.io/name: atlantis
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: atlantis
+  namespace: atlantis
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: atlantis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: atlantis
+  namespace: atlantis
+spec:
+  serviceName: atlantis-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: atlantis
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: atlantis
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 600
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 1000
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: atlantis
+      containers:
+      - name: atlantis
+        image: ghcr.io/runatlantis/atlantis:v<VERSION>
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 4141
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: ATLANTIS_REPLICA_ADVERTISE_URL
+          value: http://$(POD_NAME).atlantis-headless.$(POD_NAMESPACE).svc.cluster.local:4141
+        - name: ATLANTIS_OWNERSHIP_TTL_SECONDS
+          value: "30"
+        - name: ATLANTIS_INTERNAL_COMMAND_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: atlantis-ha
+              key: internal-command-token
+        - name: ATLANTIS_LOCKING_DB_TYPE
+          value: redis
+        - name: ATLANTIS_REDIS_HOST
+          value: redis-primary.redis.svc.cluster.local
+        - name: ATLANTIS_REDIS_PORT
+          value: "6379"
+        - name: ATLANTIS_REDIS_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: atlantis-ha
+              key: redis-username
+        - name: ATLANTIS_REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: atlantis-ha
+              key: redis-password
+        - name: ATLANTIS_REDIS_TLS_ENABLED
+          value: "true"
+        - name: ATLANTIS_REDIS_INSECURE_SKIP_VERIFY
+          value: "false"
+        - name: ATLANTIS_PORT
+          value: "4141"
+        - name: ATLANTIS_DATA_DIR
+          value: /atlantis
+        - name: ATLANTIS_REPO_ALLOWLIST
+          value: github.com/yourorg/*
+        - name: ATLANTIS_GH_USER
+          value: your-atlantis-user
+        - name: ATLANTIS_GH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: atlantis-ha
+              key: github-token
+        - name: ATLANTIS_GH_WEBHOOK_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: atlantis-ha
+              key: github-webhook-secret
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: http
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          periodSeconds: 30
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 250m
+            memory: 512Mi
+          limits:
+            memory: 2Gi
+        volumeMounts:
+        - name: data
+          mountPath: /atlantis
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 10Gi
+---
+# NetworkPolicy cannot filter HTTP paths. Configure the public Ingress/Gateway
+# to reject /internal/commands/*; this policy limits pod ingress to Atlantis and
+# the example ingress-controller namespace. Adjust labels for your cluster.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: atlantis-ingress
+  namespace: atlantis
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: atlantis
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: atlantis
+    ports:
+    - protocol: TCP
+      port: 4141
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 4141
