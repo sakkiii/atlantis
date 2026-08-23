@@ -67,6 +67,7 @@ type Project struct {
 	PolicyCheck               *bool      `yaml:"policy_check,omitempty"`
 	CustomPolicyCheck         *bool      `yaml:"custom_policy_check,omitempty"`
 	SilencePRComments         []string   `yaml:"silence_pr_comments,omitempty"`
+	AutoApply                 *bool      `yaml:"auto_apply,omitempty"`
 }
 
 // IsTerraformProjectDir returns true if the directory contains files that make it look like a Terraform project
@@ -155,6 +156,13 @@ func (p Project) Validate() error {
 		return errors.New("name: cannot be used with glob patterns in 'dir'; glob patterns expand to multiple projects which cannot share the same name")
 	}
 
+	// Validate that auto_apply requires non-empty apply_requirements
+	if p.AutoApply != nil && *p.AutoApply {
+		if len(p.ApplyRequirements) == 0 {
+			return errors.New("auto_apply requires at least one apply_requirement")
+		}
+	}
+
 	return validation.ValidateStruct(&p,
 		validation.Field(&p.Dir, validation.Required, validation.By(validDir)),
 		validation.Field(&p.Workspace, validation.By(validWorkspace)),
@@ -238,6 +246,10 @@ func (p Project) ToValid() valid.Project {
 
 	if p.SilencePRComments != nil {
 		v.SilencePRComments = p.SilencePRComments
+	}
+
+	if p.AutoApply != nil {
+		v.AutoApply = p.AutoApply
 	}
 
 	return v

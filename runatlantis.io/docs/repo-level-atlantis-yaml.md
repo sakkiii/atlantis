@@ -81,6 +81,7 @@ projects:
   plan_requirements: [mergeable, approved, undiverged] # Available since v0.17.0
   apply_requirements: [mergeable, approved, undiverged] # Available since v0.17.0
   import_requirements: [mergeable, approved, undiverged] # Available since v0.17.0
+  auto_apply: true
   silence_pr_comments: ["apply"] # Available since v0.17.0
   execution_order_group: 1 # Available since v0.17.0
   depends_on: # Available since v0.20.0
@@ -315,6 +316,34 @@ projects:
 to be allowed to set this key. See [Server-Side Repo Config Use Cases](server-side-repo-config.md#repos-can-set-their-own-apply-requirements).
 :::
 
+### Auto Apply
+
+`auto_apply` applies a project automatically once all of its `apply_requirements` are satisfied, without a user running `atlantis apply`.
+
+```yaml
+version: 3
+projects:
+  - dir: .
+    auto_apply: true
+    apply_requirements: [approved, mergeable]
+```
+
+:::tip
+`auto_apply` requires at least one `apply_requirement`. Setting `auto_apply: true` with an empty `apply_requirements` is rejected during config validation.
+:::
+
+Flow:
+1. Autoplan runs `plan` on every pull request update.
+2. A reviewer approves the pull request (GitHub `pull_request_review` webhook event).
+3. Atlantis re-evaluates each project with `auto_apply: true` and applies the ones whose `apply_requirements` all pass.
+
+Notes:
+- `auto_apply` only triggers on GitHub pull request approval events (submitted reviews with state `approved`). The Atlantis GitHub App must be subscribed to the `pull_request_review` webhook event for this to work.
+- Approvals on draft pull requests are ignored unless draft PRs are allowed.
+- If the global apply lock is enabled, auto-apply is skipped and a comment is posted on the pull request.
+- Failures during auto-apply are reported via commit statuses; Atlantis does not post a failure comment on the pull request to avoid noise.
+- Only GitHub is currently supported. GitLab and Azure DevOps review events are not handled.
+
 ### Order of planning/applying
 
 ```yaml
@@ -473,6 +502,7 @@ terraform_version: 0.11.0
 plan_requirements: ["approved"]
 apply_requirements: ["approved"]
 import_requirements: ["approved"]
+auto_apply: true
 silence_pr_comments: ["apply"]
 workflow: myworkflow
 ```
@@ -492,6 +522,7 @@ workflow: myworkflow
 | terraform_version                       | string                  | none            | no       | A specific Terraform version to use when running commands for this project. Must be [Semver compatible](https://semver.org/), ex. `v0.11.0`, `0.12.0-beta1`.                                                                            |
 | plan_requirements<br />_(restricted)_   | array\[string\]         | none            | no       | Requirements that must be satisfied before `atlantis plan` can be run. Currently the only supported requirements are `approved`, `mergeable`, and `undiverged`. See [Command Requirements](command-requirements.md) for more details.   |
 | apply_requirements<br />_(restricted)_  | array\[string\]         | none            | no       | Requirements that must be satisfied before `atlantis apply` can be run. Currently the only supported requirements are `approved`, `mergeable`, and `undiverged`. See [Command Requirements](command-requirements.md) for more details.  |
+| auto_apply                              | bool                    | `false`         | no       | Whether to automatically apply this project when its `apply_requirements` are all satisfied. Requires at least one `apply_requirement` to be set. See [Auto Apply](#auto-apply) for more details.                                          |
 | import_requirements<br />_(restricted)_ | array\[string\]         | none            | no       | Requirements that must be satisfied before `atlantis import` can be run. Currently the only supported requirements are `approved`, `mergeable`, and `undiverged`. See [Command Requirements](command-requirements.md) for more details. |
 | silence_pr_comments                     | array\[string\]         | none            | no       | Silence PR comments from defined stages while preserving PR status checks. Supported values are: `plan`, `apply`.                                                                                                                       |
 | workflow <br />_(restricted)_           | string                  | none            | no       | A custom workflow. If not specified, Atlantis will use its default workflow.                                                                                                                                                            |

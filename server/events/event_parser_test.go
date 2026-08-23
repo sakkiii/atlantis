@@ -185,6 +185,97 @@ func TestParseGithubPullEventFromDraft(t *testing.T) {
 	Equals(t, models.OpenedPullEvent, evType)
 }
 
+func TestParseGithubPullRequestReviewEvent(t *testing.T) {
+	logger := logging.NewNoopLogger(t)
+	_, _, _, _, _, err := parser.ParseGithubPullRequestReviewEvent(logger, &github.PullRequestReviewEvent{})
+	ErrEquals(t, "pull_request is null", err)
+
+	event := github.PullRequestReviewEvent{
+		Action: github.Ptr("submitted"),
+		Review: &github.PullRequestReview{
+			State: github.Ptr("approved"),
+		},
+		PullRequest: &githubtestdata.Pull,
+		Sender: &github.User{
+			Login: github.Ptr("reviewer"),
+		},
+	}
+
+	testEvent := deepcopy.Copy(event).(github.PullRequestReviewEvent)
+	testEvent.PullRequest = nil
+	_, _, _, _, _, err = parser.ParseGithubPullRequestReviewEvent(logger, &testEvent)
+	ErrEquals(t, "pull_request is null", err)
+
+	testEvent = deepcopy.Copy(event).(github.PullRequestReviewEvent)
+	testEvent.Review = nil
+	_, _, _, _, _, err = parser.ParseGithubPullRequestReviewEvent(logger, &testEvent)
+	ErrEquals(t, "review is null", err)
+
+	testEvent = deepcopy.Copy(event).(github.PullRequestReviewEvent)
+	testEvent.Action = github.Ptr("dismissed")
+	_, _, _, _, _, err = parser.ParseGithubPullRequestReviewEvent(logger, &testEvent)
+	ErrEquals(t, "review event action is not submitted", err)
+
+	testEvent = deepcopy.Copy(event).(github.PullRequestReviewEvent)
+	testEvent.Review.State = github.Ptr("changes_requested")
+	_, _, _, _, _, err = parser.ParseGithubPullRequestReviewEvent(logger, &testEvent)
+	ErrEquals(t, "review state is not approved", err)
+
+	testEvent = deepcopy.Copy(event).(github.PullRequestReviewEvent)
+	testEvent.Sender = nil
+	_, _, _, _, _, err = parser.ParseGithubPullRequestReviewEvent(logger, &testEvent)
+	ErrEquals(t, "sender is null", err)
+
+	testEvent = deepcopy.Copy(event).(github.PullRequestReviewEvent)
+	testEvent.Sender.Login = nil
+	_, _, _, _, _, err = parser.ParseGithubPullRequestReviewEvent(logger, &testEvent)
+	ErrEquals(t, "sender.login is null", err)
+
+	// draft PRs are ignored by default
+	testEvent = deepcopy.Copy(event).(github.PullRequestReviewEvent)
+	testEvent.PullRequest.Draft = github.Ptr(true)
+	_, _, _, _, _, err = parser.ParseGithubPullRequestReviewEvent(logger, &testEvent)
+	ErrEquals(t, "pull request is a draft", err)
+
+	// drafts are accepted when allowed
+	parser.AllowDraftPRs = true
+	defer func() { parser.AllowDraftPRs = false }()
+	_, evType, _, _, _, err := parser.ParseGithubPullRequestReviewEvent(logger, &testEvent)
+	Ok(t, err)
+	Equals(t, models.ReviewApprovedEvent, evType)
+
+	// this should be successful
+	parser.AllowDraftPRs = false
+	actPull, evType, actBaseRepo, actHeadRepo, actUser, err := parser.ParseGithubPullRequestReviewEvent(logger, &event)
+	Ok(t, err)
+	expBaseRepo := models.Repo{
+		Owner:             "owner",
+		FullName:          "owner/repo",
+		CloneURL:          "https://github-user:github-token@github.com/owner/repo.git",
+		SanitizedCloneURL: "https://github-user:<redacted>@github.com/owner/repo.git",
+		Name:              "repo",
+		VCSHost: models.VCSHost{
+			Hostname: "github.com",
+			Type:     models.Github,
+		},
+	}
+	Equals(t, expBaseRepo, actBaseRepo)
+	Equals(t, expBaseRepo, actHeadRepo)
+	Equals(t, models.PullRequest{
+		URL:        githubtestdata.Pull.GetHTMLURL(),
+		Author:     githubtestdata.Pull.User.GetLogin(),
+		Body:       githubtestdata.Pull.GetBody(),
+		HeadBranch: githubtestdata.Pull.Head.GetRef(),
+		BaseBranch: githubtestdata.Pull.Base.GetRef(),
+		HeadCommit: githubtestdata.Pull.Head.GetSHA(),
+		Num:        githubtestdata.Pull.GetNumber(),
+		State:      models.OpenPullState,
+		BaseRepo:   expBaseRepo,
+	}, actPull)
+	Equals(t, models.ReviewApprovedEvent, evType)
+	Equals(t, models.User{Username: "reviewer"}, actUser)
+}
+
 func TestParseGithubPullEvent_EventType(t *testing.T) {
 	logger := logging.NewNoopLogger(t)
 	cases := []struct {

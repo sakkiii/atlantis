@@ -198,6 +198,7 @@ type Project struct {
 	PolicyCheck               *bool
 	CustomPolicyCheck         *bool
 	SilencePRComments         []string
+	AutoApply                 *bool
 }
 
 // GetName returns the name of the project or an empty string if there is no
@@ -207,6 +208,14 @@ func (p Project) GetName() string {
 		return *p.Name
 	}
 	return ""
+}
+
+// GetAutoApply returns true if auto_apply is enabled for this project.
+func (p Project) GetAutoApply() bool {
+	if p.AutoApply != nil {
+		return *p.AutoApply
+	}
+	return false
 }
 
 type Autoplan struct {

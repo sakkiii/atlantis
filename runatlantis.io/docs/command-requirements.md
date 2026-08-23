@@ -14,6 +14,8 @@ commands can be run:
 If the requirement is not met, users will see an error if they try to run `atlantis apply`:
 ![Mergeable Apply Requirement](./images/apply-requirement.png)
 
+Projects with [`auto_apply: true`](repo-level-atlantis-yaml.md#auto-apply) are only applied when all of their `apply_requirements` are satisfied. If a requirement is not met, the project is skipped (no apply is run) and no error is commented on the pull request.
+
 ## Supported Requirements
 
 ### Approved

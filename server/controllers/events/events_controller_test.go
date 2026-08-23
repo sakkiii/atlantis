@@ -465,6 +465,41 @@ func TestPost_GithubPullRequestInvalid(t *testing.T) {
 	ResponseContains(t, w, http.StatusBadRequest, "parsing pull data: err")
 }
 
+func TestPost_GithubPullRequestReviewApproved(t *testing.T) {
+	t.Log("when the event is a github pull request review with approval we trigger auto-apply")
+	e, v, _, _, p, cr, _, _, _ := setup(t)
+	req, _ := http.NewRequest("GET", "", bytes.NewBuffer(nil))
+	req.Header.Set(githubHeader, "pull_request_review")
+
+	event := `{"action": "submitted"}`
+	When(v.Validate(req, secret)).ThenReturn([]byte(event), nil)
+	pull := models.PullRequest{Num: 1}
+	baseRepo := models.Repo{FullName: "owner/repo"}
+	user := models.User{Username: "reviewer"}
+	When(p.ParseGithubPullRequestReviewEvent(Any[logging.SimpleLogging](), Any[*github.PullRequestReviewEvent]())).ThenReturn(pull, models.ReviewApprovedEvent, baseRepo, baseRepo, user, nil)
+	w := httptest.NewRecorder()
+	e.Post(w, req)
+	ResponseContains(t, w, http.StatusOK, "Processing auto-apply...")
+
+	cr.VerifyWasCalledOnce().RunAutoApplyCommand(baseRepo, baseRepo, pull, user)
+}
+
+func TestPost_GithubPullRequestReviewNotApproved(t *testing.T) {
+	t.Log("when the event is a github pull request review that is not an approval we ignore it")
+	e, v, _, _, p, cr, _, _, _ := setup(t)
+	req, _ := http.NewRequest("GET", "", bytes.NewBuffer(nil))
+	req.Header.Set(githubHeader, "pull_request_review")
+
+	event := `{"action": "dismissed"}`
+	When(v.Validate(req, secret)).ThenReturn([]byte(event), nil)
+	When(p.ParseGithubPullRequestReviewEvent(Any[logging.SimpleLogging](), Any[*github.PullRequestReviewEvent]())).ThenReturn(models.PullRequest{}, models.ReviewApprovedEvent, models.Repo{}, models.Repo{}, models.User{}, errors.New("review state is not approved"))
+	w := httptest.NewRecorder()
+	e.Post(w, req)
+	ResponseContains(t, w, http.StatusOK, "Ignoring pull request review event: review state is not approved")
+
+	cr.VerifyWasCalled(Never()).RunAutoApplyCommand(Any[models.Repo](), Any[models.Repo](), Any[models.PullRequest](), Any[models.User]())
+}
+
 func TestPost_GitlabMergeRequestInvalid(t *testing.T) {
 	t.Log("when the event is a gitlab merge request with invalid data we return a 400")
 	e, _, gl, _, p, _, _, _, _ := setup(t)

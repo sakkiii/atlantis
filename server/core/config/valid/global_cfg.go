@@ -141,6 +141,7 @@ type MergedProjectCfg struct {
 	PolicyCheck               bool
 	CustomPolicyCheck         bool
 	SilencePRComments         []string
+	AutoApply                 bool
 }
 
 // WorkflowHook is a map of custom run commands to run before or after workflows.
@@ -429,6 +430,11 @@ func (g GlobalCfg) MergeProjectCfg(log logging.SimpleLogging, repoID string, pro
 		SilencePRCommentsKey, strings.Join(silencePRComments, ","),
 	)
 
+	autoApply := false
+	if proj.AutoApply != nil {
+		autoApply = *proj.AutoApply
+	}
+
 	return MergedProjectCfg{
 		PlanRequirements:          planReqs,
 		ApplyRequirements:         applyReqs,
@@ -450,6 +456,7 @@ func (g GlobalCfg) MergeProjectCfg(log logging.SimpleLogging, repoID string, pro
 		PolicyCheck:               policyCheck,
 		CustomPolicyCheck:         customPolicyCheck,
 		SilencePRComments:         silencePRComments,
+		AutoApply:                 autoApply,
 	}
 }
 
@@ -476,6 +483,7 @@ func (g GlobalCfg) DefaultProjCfg(log logging.SimpleLogging, repoID string, repo
 		PolicyCheck:               policyCheck,
 		CustomPolicyCheck:         customPolicyCheck,
 		SilencePRComments:         silencePRComments,
+		AutoApply:                 false,
 	}
 }
 

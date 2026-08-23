@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/runatlantis/atlantis/server/core/boltdb"
+	"github.com/runatlantis/atlantis/server/core/config/raw"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/locking"
@@ -61,6 +62,7 @@ var applyLockChecker *lockingmocks.MockApplyLockChecker
 var lockingLocker *lockingmocks.MockLocker
 var applyCommandRunner *events.ApplyCommandRunner
 var unlockCommandRunner *events.UnlockCommandRunner
+var autoApplyCommandRunner events.AutoApplyCommandRunner
 var importCommandRunner *events.ImportCommandRunner
 var stateCommandRunner *events.StateCommandRunner
 var preWorkflowHooksCommandRunner events.PreWorkflowHooksCommandRunner
@@ -285,6 +287,41 @@ func setup(t *testing.T, options ...func(testConfig *TestConfig)) *vcsmocks.Mock
 	globalCfg := valid.NewGlobalCfgFromArgs(valid.GlobalCfgArgs{})
 	scope := metricstest.NewLoggingScope(t, logger, "atlantis")
 
+	requirementHandler := &events.DefaultCommandRequirementHandler{
+		WorkingDir:    workingDir,
+		VCSStatusName: testConfig.StatusName,
+	}
+	teamAllowlistChecker, err := command.NewTeamAllowlistChecker("")
+	Ok(t, err)
+
+	autoApplyCommandRunner = events.NewAutoApplyCommandRunner(
+		vcsClient,
+		applyLockChecker,
+		commitUpdater,
+		projectCommandBuilder,
+		projectCommandRunner,
+		cancellationTracker,
+		autoMerger,
+		pullUpdater,
+		dbUpdater,
+		testConfig.database,
+		testConfig.parallelPoolSize,
+		testConfig.SilenceNoProjects,
+		testConfig.silenceVCSStatusNoProjects,
+		workingDirLocker,
+		pullReqStatusFetcher,
+		testConfig.livePullHeadFetcher,
+		workingDir,
+		testConfig.DisableAutomergeLabel,
+		logger,
+		scope.SubScope("auto_apply"),
+		globalCfg,
+		requirementHandler,
+		teamAllowlistChecker,
+		false,
+		"allow-fork-prs-flag",
+	)
+
 	ch = events.DefaultCommandRunner{
 		VCSClient:                      vcsClient,
 		CommentCommandRunnerByCmd:      commentCommandRunnerByCmd,
@@ -303,6 +340,7 @@ func setup(t *testing.T, options ...func(testConfig *TestConfig)) *vcsmocks.Mock
 		PostWorkflowHooksCommandRunner: postWorkflowHooksCommandRunner,
 		PullStatusFetcher:              testConfig.database,
 		CommitStatusUpdater:            commitUpdater,
+		AutoApplyCommandRunner:         autoApplyCommandRunner,
 	}
 
 	return vcsClient
@@ -2849,4 +2887,124 @@ func TestRunAutoplanCommand_DrainNotOngoing(t *testing.T) {
 	ch.RunAutoplanCommand(testdata.GithubRepo, testdata.GithubRepo, testdata.Pull, testdata.User)
 	projectCommandBuilder.VerifyWasCalledOnce().BuildAutoplanCommands(Any[*command.Context]())
 	Equals(t, 0, drainer.GetStatus().InProgressOps)
+}
+
+func setupAutoApplyHappyPath(t *testing.T) models.PullRequest {
+	t.Helper()
+	head := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	database := newTestBoltDB(t)
+	setup(t, func(tc *TestConfig) {
+		tc.database = database
+		tc.livePullHeadFetcher = fakeLivePullHeadFetcher{head: head, base: "basebranch"}
+	})
+	modelPull := models.PullRequest{BaseRepo: testdata.GithubRepo, State: models.OpenPullState, Num: testdata.Pull.Num, HeadCommit: head, BaseBranch: "basebranch"}
+	_, err := database.UpdatePullWithResults(modelPull, []command.ProjectResult{plannedProjectResult("dirA", events.DefaultWorkspace, "projA")})
+	Ok(t, err)
+	return modelPull
+}
+
+func autoApplyProjectCtx(modelPull models.PullRequest) command.ProjectContext {
+	return command.ProjectContext{
+		CommandName:       command.Apply,
+		RepoRelDir:        "dirA",
+		Workspace:         events.DefaultWorkspace,
+		ProjectName:       "projA",
+		AutoApply:         true,
+		ApplyRequirements: []string{raw.ApprovedRequirement, raw.MergeableRequirement},
+		Pull:              modelPull,
+		PullReqStatus: models.PullReqStatus{
+			ApprovalStatus:  models.ApprovalStatus{IsApproved: true},
+			MergeableStatus: models.MergeableStatus{IsMergeable: true},
+		},
+	}
+}
+
+func TestRunAutoApplyCommand_AppliesProjectWhenRequirementsMet(t *testing.T) {
+	t.Log("if a project has auto_apply: true and all apply requirements pass then apply is run")
+	modelPull := setupAutoApplyHappyPath(t)
+
+	When(pullReqStatusFetcher.FetchPullStatus(Any[logging.SimpleLogging](), Any[models.PullRequest]())).ThenReturn(models.PullReqStatus{
+		ApprovalStatus:  models.ApprovalStatus{IsApproved: true},
+		MergeableStatus: models.MergeableStatus{IsMergeable: true},
+	}, nil)
+
+	projectCtx := autoApplyProjectCtx(modelPull)
+	When(projectCommandBuilder.BuildApplyCommands(Any[*command.Context](), Any[*events.CommentCommand]())).ThenReturn([]command.ProjectContext{projectCtx}, nil)
+	When(projectCommandRunner.Apply(projectCtx)).ThenReturn(command.ProjectCommandOutput{ApplySuccess: "applied"})
+
+	ch.RunAutoApplyCommand(testdata.GithubRepo, testdata.GithubRepo, modelPull, testdata.User)
+
+	projectCommandRunner.VerifyWasCalledOnce().Apply(projectCtx)
+}
+
+func TestRunAutoApplyCommand_ClosedPullNoOp(t *testing.T) {
+	t.Log("if the pull request is not open then auto-apply is skipped")
+	setup(t)
+	modelPull := models.PullRequest{BaseRepo: testdata.GithubRepo, State: models.ClosedPullState, Num: testdata.Pull.Num}
+	ch.RunAutoApplyCommand(testdata.GithubRepo, testdata.GithubRepo, modelPull, testdata.User)
+	projectCommandBuilder.VerifyWasCalled(Never()).BuildApplyCommands(Any[*command.Context](), Any[*events.CommentCommand]())
+	projectCommandRunner.VerifyWasCalled(Never()).Apply(Any[command.ProjectContext]())
+}
+
+func TestRunAutoApplyCommand_NoProjectsNoOp(t *testing.T) {
+	t.Log("if no projects are found then auto-apply is skipped")
+	modelPull := setupAutoApplyHappyPath(t)
+	When(projectCommandBuilder.BuildApplyCommands(Any[*command.Context](), Any[*events.CommentCommand]())).ThenReturn([]command.ProjectContext{}, nil)
+
+	ch.RunAutoApplyCommand(testdata.GithubRepo, testdata.GithubRepo, modelPull, testdata.User)
+
+	projectCommandRunner.VerifyWasCalled(Never()).Apply(Any[command.ProjectContext]())
+}
+
+func TestRunAutoApplyCommand_NoAutoApplyProjectsNoOp(t *testing.T) {
+	t.Log("if no projects have auto_apply: true then auto-apply is skipped")
+	modelPull := setupAutoApplyHappyPath(t)
+	When(projectCommandBuilder.BuildApplyCommands(Any[*command.Context](), Any[*events.CommentCommand]())).ThenReturn([]command.ProjectContext{
+		{
+			CommandName: command.Apply,
+			RepoRelDir:  "dirA",
+			Workspace:   events.DefaultWorkspace,
+			ProjectName: "projA",
+			AutoApply:   false,
+		},
+	}, nil)
+
+	ch.RunAutoApplyCommand(testdata.GithubRepo, testdata.GithubRepo, modelPull, testdata.User)
+
+	projectCommandRunner.VerifyWasCalled(Never()).Apply(Any[command.ProjectContext]())
+}
+
+func TestRunAutoApplyCommand_RequirementsNotMetNoOp(t *testing.T) {
+	t.Log("if a project has auto_apply: true but its apply requirements are not met then apply is skipped")
+	modelPull := setupAutoApplyHappyPath(t)
+	projectCtx := autoApplyProjectCtx(modelPull)
+	projectCtx.PullReqStatus = models.PullReqStatus{ApprovalStatus: models.ApprovalStatus{IsApproved: false}}
+	When(projectCommandBuilder.BuildApplyCommands(Any[*command.Context](), Any[*events.CommentCommand]())).ThenReturn([]command.ProjectContext{projectCtx}, nil)
+
+	ch.RunAutoApplyCommand(testdata.GithubRepo, testdata.GithubRepo, modelPull, testdata.User)
+
+	projectCommandRunner.VerifyWasCalled(Never()).Apply(Any[command.ProjectContext]())
+}
+
+func TestRunAutoApplyCommand_ApplyLockedNoOp(t *testing.T) {
+	t.Log("if the global apply lock is present then auto-apply is skipped and a comment is posted")
+	vcsClient := setup(t, func(tc *TestConfig) {
+		tc.applyLockCheckerReturn = locking.ApplyCommandLock{Locked: true}
+	})
+	modelPull := models.PullRequest{BaseRepo: testdata.GithubRepo, State: models.OpenPullState, Num: testdata.Pull.Num}
+	ch.RunAutoApplyCommand(testdata.GithubRepo, testdata.GithubRepo, modelPull, testdata.User)
+
+	projectCommandBuilder.VerifyWasCalled(Never()).BuildApplyCommands(Any[*command.Context](), Any[*events.CommentCommand]())
+	projectCommandRunner.VerifyWasCalled(Never()).Apply(Any[command.ProjectContext]())
+	vcsClient.VerifyWasCalledOnce().CreateComment(
+		Any[logging.SimpleLogging](), Eq(testdata.GithubRepo), Eq(modelPull.Num), Eq("Running `atlantis apply` is disabled."), Eq("apply"))
+}
+
+func TestRunAutoApplyCommand_DrainOngoing(t *testing.T) {
+	t.Log("if drain is ongoing then a shutdown message should be displayed")
+	vcsClient := setup(t)
+	drainer.ShutdownBlocking()
+	ch.RunAutoApplyCommand(testdata.GithubRepo, testdata.GithubRepo, testdata.Pull, testdata.User)
+	vcsClient.VerifyWasCalledOnce().CreateComment(
+		Any[logging.SimpleLogging](), Eq(testdata.GithubRepo), Eq(testdata.Pull.Num), Eq("Atlantis server is shutting down, please try again later."), Eq("apply"))
 }

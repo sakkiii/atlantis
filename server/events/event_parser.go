@@ -233,6 +233,16 @@ type EventParsing interface {
 		pull models.PullRequest, pullEventType models.PullRequestEventType,
 		baseRepo models.Repo, headRepo models.Repo, user models.User, err error)
 
+	// ParseGithubPullRequestReviewEvent parses GitHub pull request review events.
+	// pull is the parsed pull request.
+	// pullEventType is the type of event (review_approved).
+	// baseRepo is the repo the pull request will be merged into.
+	// headRepo is the repo the pull request branch is from.
+	// user is the user who submitted the review.
+	ParseGithubPullRequestReviewEvent(logger logging.SimpleLogging, reviewEvent *github.PullRequestReviewEvent) (
+		pull models.PullRequest, pullEventType models.PullRequestEventType,
+		baseRepo models.Repo, headRepo models.Repo, user models.User, err error)
+
 	// ParseGithubRepo parses the response from the GitHub API endpoint that
 	// returns a repo into the Atlantis model.
 	ParseGithubRepo(ghRepo *github.Repository) (models.Repo, error)
@@ -576,6 +586,54 @@ func (e *EventParser) ParseGithubPullEvent(logger logging.SimpleLogging, pullEve
 	default:
 		pullEventType = models.OtherPullEvent
 	}
+	user = models.User{Username: senderUsername}
+	return
+}
+
+// ParseGithubPullRequestReviewEvent parses GitHub pull request review events.
+// See EventParsing for return value docs.
+func (e *EventParser) ParseGithubPullRequestReviewEvent(logger logging.SimpleLogging, reviewEvent *github.PullRequestReviewEvent) (pull models.PullRequest, pullEventType models.PullRequestEventType, baseRepo models.Repo, headRepo models.Repo, user models.User, err error) {
+	if reviewEvent.PullRequest == nil {
+		err = errors.New("pull_request is null")
+		return
+	}
+	if reviewEvent.Review == nil {
+		err = errors.New("review is null")
+		return
+	}
+	if reviewEvent.GetAction() != "submitted" {
+		err = errors.New("review event action is not submitted")
+		return
+	}
+	if reviewEvent.Review.GetState() != "approved" {
+		err = errors.New("review state is not approved")
+		return
+	}
+
+	pull, baseRepo, headRepo, err = e.ParseGithubPull(logger, reviewEvent.PullRequest)
+	if err != nil {
+		return
+	}
+	if reviewEvent.Sender == nil {
+		err = errors.New("sender is null")
+		return
+	}
+	senderUsername := reviewEvent.Sender.GetLogin()
+	if senderUsername == "" {
+		err = errors.New("sender.login is null")
+		return
+	}
+
+	// If it's a draft PR we ignore it for auto-planning if configured to do so
+	// however it's still possible for users to run plan on it manually via a
+	// comment so if any draft PR is closed we still need to check if we need
+	// to delete its locks.
+	if reviewEvent.GetPullRequest().GetDraft() && !e.AllowDraftPRs {
+		err = errors.New("pull request is a draft")
+		return
+	}
+
+	pullEventType = models.ReviewApprovedEvent
 	user = models.User{Username: senderUsername}
 	return
 }

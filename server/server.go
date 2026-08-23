@@ -1009,6 +1009,34 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		}
 	}
 
+	autoApplyCommandRunner := events.NewAutoApplyCommandRunner(
+		vcsClient,
+		applyLockingClient,
+		commitStatusUpdater,
+		projectCommandBuilder,
+		instrumentedProjectCmdRunner,
+		cancellationTracker,
+		autoMerger,
+		pullUpdater,
+		dbUpdater,
+		database,
+		userConfig.ParallelPoolSize,
+		userConfig.SilenceNoProjects,
+		userConfig.SilenceVCSStatusNoProjects,
+		workingDirLocker,
+		pullReqStatusFetcher,
+		livePullHeadFetcher,
+		workingDir,
+		userConfig.DisableAutomergeLabel,
+		logger,
+		statsScope.SubScope("auto_apply"),
+		globalCfg,
+		applyRequirementHandler,
+		teamAllowlistChecker,
+		userConfig.AllowForkPRs,
+		config.AllowForkPRsFlag,
+	)
+
 	varFileAllowlistChecker, err := events.NewVarFileAllowlistChecker(userConfig.VarFileAllowlist)
 	if err != nil {
 		return nil, err
@@ -1040,6 +1068,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		TeamAllowlistChecker:           teamAllowlistChecker,
 		VarFileAllowlistChecker:        varFileAllowlistChecker,
 		CommitStatusUpdater:            commitStatusUpdater,
+		AutoApplyCommandRunner:         autoApplyCommandRunner,
 	}
 	repoAllowlist, err := events.NewRepoAllowlistChecker(userConfig.RepoAllowlist)
 	if err != nil {

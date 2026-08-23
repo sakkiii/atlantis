@@ -38,6 +38,9 @@ type CommandRunner interface {
 	// and then calling the appropriate services to finish executing the command.
 	RunCommentCommand(baseRepo models.Repo, maybeHeadRepo *models.Repo, maybePull *models.PullRequest, user models.User, pullNum int, cmd *CommentCommand)
 	RunAutoplanCommand(baseRepo models.Repo, headRepo models.Repo, pull models.PullRequest, user models.User)
+	// RunAutoApplyCommand evaluates projects with auto_apply: true and runs apply
+	// for those that meet their configured apply_requirements.
+	RunAutoApplyCommand(baseRepo models.Repo, headRepo models.Repo, pull models.PullRequest, user models.User)
 }
 
 //go:generate go tool pegomock generate github.com/runatlantis/atlantis/server/events --package mocks -o mocks/mock_github_pull_getter.go GithubPullGetter
@@ -98,6 +101,11 @@ func preWorkflowHooksConfigured(runner PreWorkflowHooksCommandRunner, ctx *comma
 	return ok && checker.HasPreWorkflowHooks(ctx)
 }
 
+// AutoApplyCommandRunner runs auto-apply for projects with auto_apply: true.
+type AutoApplyCommandRunner interface {
+	Run(baseRepo models.Repo, headRepo models.Repo, pull models.PullRequest, user models.User)
+}
+
 // DefaultCommandRunner is the first step when processing a comment command.
 type DefaultCommandRunner struct {
 	VCSClient                vcs.Client `validate:"required"`
@@ -139,6 +147,7 @@ type DefaultCommandRunner struct {
 	TeamAllowlistChecker           command.TeamAllowlistChecker          `validate:"required"`
 	VarFileAllowlistChecker        *VarFileAllowlistChecker              `validate:"required"`
 	CommitStatusUpdater            CommitStatusUpdater                   `validate:"required"`
+	AutoApplyCommandRunner         AutoApplyCommandRunner                `validate:"required"`
 }
 
 // RunAutoplanCommand runs plan and policy_checks when a pull request is opened or updated.
@@ -247,6 +256,20 @@ func (c *DefaultCommandRunner) RunAutoplanCommand(baseRepo models.Repo, headRepo
 	c.PostWorkflowHooksCommandRunner.RunPostHooks(ctx, cmd) // nolint: errcheck
 }
 
+// RunAutoApplyCommand evaluates projects with auto_apply: true and runs apply
+// for those that meet their configured apply_requirements.
+func (c *DefaultCommandRunner) RunAutoApplyCommand(baseRepo models.Repo, headRepo models.Repo, pull models.PullRequest, user models.User) {
+	if opStarted := c.Drainer.StartOp(); !opStarted {
+		if commentErr := c.VCSClient.CreateComment(c.Logger, baseRepo, pull.Num, ShutdownComment, command.Apply.String()); commentErr != nil {
+			c.Logger.Log(logging.Error, "unable to comment that Atlantis is shutting down: %s", commentErr)
+		}
+		return
+	}
+	defer c.Drainer.OpDone()
+
+	c.AutoApplyCommandRunner.Run(baseRepo, headRepo, pull, user)
+}
+
 // commentUserDoesNotHavePermissions comments on the pull request that the user
 // is not allowed to execute the command.
 func (c *DefaultCommandRunner) commentUserDoesNotHavePermissions(baseRepo models.Repo, pullNum int, user models.User, cmd *CommentCommand) {
@@ -310,19 +333,61 @@ func teamSet(teams []string) map[string]struct{} {
 	return result
 }
 
-func (c *DefaultCommandRunner) addHierarchyTeamsForCommand(repo models.Repo, user *models.User, cmdName string) {
-	c.addHierarchyTeamsForCommandForTeams(repo, user, cmdName, user.Teams)
+func fetchUserTeamsForTeamAllowlist(vcsClient vcs.Client, logger logging.SimpleLogging, repo models.Repo, user *models.User) error {
+	teams, err := vcsClient.GetTeamNamesForUser(logger, repo, *user)
+	if err != nil {
+		return err
+	}
+
+	user.Teams = teams
+	return nil
 }
 
-func (c *DefaultCommandRunner) addHierarchyTeamsForCommandForTeams(repo models.Repo, user *models.User, cmdName string, teams []string) {
-	if c.TeamAllowlistChecker == nil || !c.TeamAllowlistChecker.HasRules() {
+func checkUserPermissionsForTeamAllowlist(vcsClient vcs.Client, teamAllowlistChecker command.TeamAllowlistChecker, logger logging.SimpleLogging, repo models.Repo, user *models.User, cmdName string) (bool, error) {
+	if teamAllowlistChecker == nil || !teamAllowlistChecker.HasRules() {
+		// allowlist restriction is not enabled
+		return true, nil
+	}
+	ctx := models.TeamAllowlistCheckerContext{
+		BaseRepo:    repo,
+		CommandName: cmdName,
+		Log:         logger,
+		Pull:        models.PullRequest{},
+		User:        *user,
+		Verbose:     false,
+		API:         false,
+	}
+
+	// Fast path: user is a direct member of an allowlisted team.
+	if teamAllowlistChecker.IsCommandAllowedForAnyTeam(ctx, user.Teams, cmdName) {
+		return true, nil
+	}
+
+	// Slow path: check if the user belongs to a descendant team of any allowlisted team.
+	addHierarchyTeamsForCommandForTeams(vcsClient, teamAllowlistChecker, logger, repo, user, cmdName, user.Teams)
+	ctx.User = *user
+	if teamAllowlistChecker.IsCommandAllowedForAnyTeam(ctx, user.Teams, cmdName) {
+		return true, nil
+	}
+	return false, nil
+}
+
+// addHierarchyTeamsForCommandForTeams expands allowlisted teams to include all
+// their descendant teams (up to 20 levels deep) via GetChildTeams on the VCS
+// client. Only direct user teams authorize hierarchy grants. Parent teams
+// inferred during this pass are appended for downstream direct-membership
+// filters, not for chaining additional hierarchy grants. Non-GitHub VCS
+// providers return nil from GetChildTeams, so the expansion loop is effectively
+// a no-op for them.
+func addHierarchyTeamsForCommandForTeams(vcsClient vcs.Client, teamAllowlistChecker command.TeamAllowlistChecker, logger logging.SimpleLogging, repo models.Repo, user *models.User, cmdName string, teams []string) {
+	if teamAllowlistChecker == nil || !teamAllowlistChecker.HasRules() {
 		return
 	}
 
 	ctx := models.TeamAllowlistCheckerContext{
 		BaseRepo:    repo,
 		CommandName: cmdName,
-		Log:         c.Logger,
+		Log:         logger,
 		Pull:        models.PullRequest{},
 		User:        *user,
 		Verbose:     false,
@@ -336,7 +401,7 @@ func (c *DefaultCommandRunner) addHierarchyTeamsForCommandForTeams(repo models.R
 	currentUserTeams := teamSet(user.Teams)
 
 	const maxHierarchyDepth = 20
-	for _, allowedTeam := range c.TeamAllowlistChecker.AllTeams() {
+	for _, allowedTeam := range teamAllowlistChecker.AllTeams() {
 		if allowedTeam == "*" {
 			continue
 		}
@@ -344,12 +409,12 @@ func (c *DefaultCommandRunner) addHierarchyTeamsForCommandForTeams(repo models.R
 		if _, ok := currentUserTeams[normalizedAllowedTeam]; ok {
 			continue
 		}
-		if !c.TeamAllowlistChecker.IsCommandAllowedForTeam(ctx, allowedTeam, cmdName) {
+		if !teamAllowlistChecker.IsCommandAllowedForTeam(ctx, allowedTeam, cmdName) {
 			continue
 		}
-		descendants, err := fetchDescendantTeams(c.VCSClient, c.Logger, repo, allowedTeam, maxHierarchyDepth)
+		descendants, err := fetchDescendantTeams(vcsClient, logger, repo, allowedTeam, maxHierarchyDepth)
 		if err != nil {
-			c.Logger.Warn("Could not fetch child teams for '%s': %s", allowedTeam, err)
+			logger.Warn("Could not fetch child teams for '%s': %s", allowedTeam, err)
 			continue
 		}
 		for _, descendant := range descendants {
@@ -361,6 +426,14 @@ func (c *DefaultCommandRunner) addHierarchyTeamsForCommandForTeams(repo models.R
 			break
 		}
 	}
+}
+
+func (c *DefaultCommandRunner) addHierarchyTeamsForCommand(repo models.Repo, user *models.User, cmdName string) {
+	addHierarchyTeamsForCommandForTeams(c.VCSClient, c.TeamAllowlistChecker, c.Logger, repo, user, cmdName, user.Teams)
+}
+
+func (c *DefaultCommandRunner) addHierarchyTeamsForCommandForTeams(repo models.Repo, user *models.User, cmdName string, teams []string) {
+	addHierarchyTeamsForCommandForTeams(c.VCSClient, c.TeamAllowlistChecker, c.Logger, repo, user, cmdName, teams)
 }
 
 func (c *DefaultCommandRunner) addPolicyCheckHierarchyTeamsForPlan(repo models.Repo, user *models.User, cmdName command.Name, directUserTeams []string) {
@@ -380,32 +453,7 @@ func (c *DefaultCommandRunner) addPolicyCheckHierarchyTeamsForPlan(repo models.R
 // user.Teams so that subsequent per-project allowlist checks (which use direct membership
 // only) also pass.
 func (c *DefaultCommandRunner) checkUserPermissions(repo models.Repo, user *models.User, cmdName string) (bool, error) {
-	if c.TeamAllowlistChecker == nil || !c.TeamAllowlistChecker.HasRules() {
-		// allowlist restriction is not enabled
-		return true, nil
-	}
-	ctx := models.TeamAllowlistCheckerContext{
-		BaseRepo:    repo,
-		CommandName: cmdName,
-		Log:         c.Logger,
-		Pull:        models.PullRequest{},
-		User:        *user,
-		Verbose:     false,
-		API:         false,
-	}
-
-	// Fast path: user is a direct member of an allowlisted team.
-	if c.TeamAllowlistChecker.IsCommandAllowedForAnyTeam(ctx, user.Teams, cmdName) {
-		return true, nil
-	}
-
-	// Slow path: check if the user belongs to a descendant team of any allowlisted team.
-	c.addHierarchyTeamsForCommand(repo, user, cmdName)
-	ctx.User = *user
-	if c.TeamAllowlistChecker.IsCommandAllowedForAnyTeam(ctx, user.Teams, cmdName) {
-		return true, nil
-	}
-	return false, nil
+	return checkUserPermissionsForTeamAllowlist(c.VCSClient, c.TeamAllowlistChecker, c.Logger, repo, user, cmdName)
 }
 
 // checkVarFilesInPlanCommandAllowlisted checks if paths in a 'plan' command are allowlisted.
@@ -674,13 +722,7 @@ func (c *DefaultCommandRunner) ensureValidRepoMetadata(
 }
 
 func (c *DefaultCommandRunner) fetchUserTeams(logger logging.SimpleLogging, repo models.Repo, user *models.User) error {
-	teams, err := c.VCSClient.GetTeamNamesForUser(logger, repo, *user)
-	if err != nil {
-		return err
-	}
-
-	user.Teams = teams
-	return nil
+	return fetchUserTeamsForTeamAllowlist(c.VCSClient, logger, repo, user)
 }
 
 func (c *DefaultCommandRunner) validateCtxAndComment(ctx *command.Context, commandName command.Name, shouldComment bool) bool {

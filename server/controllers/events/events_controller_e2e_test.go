@@ -1697,6 +1697,36 @@ func setupE2E(t *testing.T, repoDir string, opt setupOption) (events_controllers
 		command.State:           stateCommandRunner,
 	}
 
+	autoApplyCommandRunner := events.NewAutoApplyCommandRunner(
+		e2eVCSClient,
+		applyLocker,
+		e2eStatusUpdater,
+		projectCommandBuilder,
+		projectCommandRunner,
+		cancellationTracker,
+		autoMerger,
+		pullUpdater,
+		dbUpdater,
+		database,
+		parallelPoolSize,
+		silenceNoProjects,
+		false,
+		locker,
+		e2ePullReqStatusFetcher,
+		nil,
+		workingDir,
+		disableAutomergeLabel,
+		logger,
+		statsScope.SubScope("auto_apply"),
+		globalCfg,
+		&events.DefaultCommandRequirementHandler{
+			WorkingDir: workingDir,
+		},
+		nil,
+		allowForkPRs,
+		"allow-fork-prs",
+	)
+
 	commandRunner := &events.DefaultCommandRunner{
 		EventParser:                    eventParser,
 		VCSClient:                      e2eVCSClient,
@@ -1714,6 +1744,7 @@ func setupE2E(t *testing.T, repoDir string, opt setupOption) (events_controllers
 		PullStatusFetcher:              database,
 		DisableAutoplan:                opt.disableAutoplan,
 		CommitStatusUpdater:            commitStatusUpdater,
+		AutoApplyCommandRunner:         autoApplyCommandRunner,
 	}
 
 	repoAllowlistChecker, err := events.NewRepoAllowlistChecker("*")

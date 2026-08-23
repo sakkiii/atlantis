@@ -193,6 +193,10 @@ func (e *VCSEventsController) handleGithubPost(w http.ResponseWriter, r *http.Re
 		resp = e.HandleGithubPullRequestEvent(logger, event, githubReqID)
 		scope = scope.SubScope(fmt.Sprintf("pr_%s", *event.Action))
 		scope = common.SetGitScopeTags(scope, event.GetRepo().GetFullName(), event.GetNumber())
+	case *github.PullRequestReviewEvent:
+		resp = e.HandleGithubPullRequestReviewEvent(logger, event, githubReqID)
+		scope = scope.SubScope(fmt.Sprintf("pr_review_%s", *event.Action))
+		scope = common.SetGitScopeTags(scope, event.GetRepo().GetFullName(), event.GetPullRequest().GetNumber())
 	default:
 		resp = HTTPResponse{
 			body: fmt.Sprintf("Ignoring unsupported event %s", githubReqID),
@@ -558,6 +562,61 @@ func (e *VCSEventsController) HandleGithubPullRequestEvent(logger logging.Simple
 
 	logger.Info("Handling GitHub Pull Request '%s' event", pullEventType.String())
 	return e.handlePullRequestEvent(logger, baseRepo, headRepo, pull, user, pullEventType)
+}
+
+// HandleGithubPullRequestReviewEvent handles GitHub pull request review events.
+// It's exported to make testing easier.
+func (e *VCSEventsController) HandleGithubPullRequestReviewEvent(logger logging.SimpleLogging, reviewEvent *github.PullRequestReviewEvent, githubReqID string) HTTPResponse {
+	pull, pullEventType, baseRepo, headRepo, user, err := e.Parser.ParseGithubPullRequestReviewEvent(logger, reviewEvent)
+	if err != nil {
+		// If the event is not an approval or is a draft, we silently ignore it.
+		logger.Debug("Ignoring pull request review event: %s", err.Error())
+		return HTTPResponse{
+			body: fmt.Sprintf("Ignoring pull request review event: %s", err.Error()),
+		}
+	}
+
+	// Annotate logger with repo and pull/merge request number.
+	logger = logger.With(
+		"repo", baseRepo.FullName,
+		"pull", strconv.Itoa(pull.Num),
+	)
+
+	logger.Info("Handling GitHub Pull Request Review '%s' event", pullEventType.String())
+	return e.handlePullRequestReviewEvent(logger, baseRepo, headRepo, pull, user, pullEventType)
+}
+
+func (e *VCSEventsController) handlePullRequestReviewEvent(logger logging.SimpleLogging, baseRepo models.Repo, headRepo models.Repo, pull models.PullRequest, user models.User, eventType models.PullRequestEventType) HTTPResponse {
+	if !e.RepoAllowlistChecker.IsAllowlisted(baseRepo.FullName, baseRepo.VCSHost.Hostname) {
+		err := fmt.Errorf("pull request review event from non-allowlisted repo '%s/%s'", baseRepo.VCSHost.Hostname, baseRepo.FullName)
+
+		return HTTPResponse{
+			body: err.Error(),
+			err: HTTPError{
+				code:       http.StatusForbidden,
+				err:        err,
+				isSilenced: e.SilenceAllowlistErrors,
+			},
+		}
+	}
+
+	// Only handle review approved events for auto-apply.
+	if eventType != models.ReviewApprovedEvent {
+		return HTTPResponse{
+			body: "Ignoring non-approved pull request review event",
+		}
+	}
+
+	// Trigger auto-apply evaluation for projects with auto_apply: true.
+	if !e.TestingMode {
+		go e.CommandRunner.RunAutoApplyCommand(baseRepo, headRepo, pull, user)
+	} else {
+		e.CommandRunner.RunAutoApplyCommand(baseRepo, headRepo, pull, user)
+	}
+
+	return HTTPResponse{
+		body: "Processing auto-apply...",
+	}
 }
 
 func (e *VCSEventsController) handlePullRequestEvent(logger logging.SimpleLogging, baseRepo models.Repo, headRepo models.Repo, pull models.PullRequest, user models.User, eventType models.PullRequestEventType) HTTPResponse {

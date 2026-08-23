@@ -261,6 +261,8 @@ const (
 	UpdatedPullEvent
 	ClosedPullEvent
 	OtherPullEvent
+	// ReviewApprovedEvent is triggered when a pull request review is submitted with approval.
+	ReviewApprovedEvent
 )
 
 func (p PullRequestEventType) String() string {
@@ -273,6 +275,8 @@ func (p PullRequestEventType) String() string {
 		return "closed"
 	case OtherPullEvent:
 		return "other"
+	case ReviewApprovedEvent:
+		return "review_approved"
 	}
 	return "<missing String() implementation>"
 }
