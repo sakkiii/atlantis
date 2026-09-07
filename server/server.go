@@ -39,6 +39,7 @@ import (
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/drift"
+	"github.com/runatlantis/atlantis/server/core/etcd"
 	"github.com/runatlantis/atlantis/server/core/redis"
 	"github.com/runatlantis/atlantis/server/core/terraform/tfclient"
 	"github.com/runatlantis/atlantis/server/jobs"
@@ -531,6 +532,38 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		if err != nil {
 			return nil, err
 		}
+	case "etcd":
+		etcdCfg, buildErr := etcd.BuildConfig(etcd.Settings{
+			Mode:             userConfig.EtcdMode,
+			DeploymentID:     userConfig.EtcdDeploymentID,
+			Namespace:        userConfig.EtcdNamespace,
+			Endpoints:        userConfig.EtcdEndpoints,
+			CAFile:           userConfig.EtcdCAFile,
+			CertFile:         userConfig.EtcdCertFile,
+			KeyFile:          userConfig.EtcdKeyFile,
+			ServerName:       userConfig.EtcdServerName,
+			Username:         userConfig.EtcdUsername,
+			PasswordFile:     userConfig.EtcdPasswordFile,
+			RequestTimeout:   userConfig.EtcdRequestTimeout,
+			StartupTimeout:   userConfig.EtcdStartupTimeout,
+			AllowInsecureDev: userConfig.EtcdAllowInsecureDev,
+		})
+		if buildErr != nil {
+			return nil, buildErr
+		}
+		if etcdCfg.Mode == etcd.ModeEmbedded {
+			// Embedded runtime and active-active ownership/routing are not yet
+			// implemented; only external single-replica database mode is wired.
+			return nil, errors.New("etcd embedded mode is not yet implemented; use --etcd-mode=external")
+		}
+		logger.Info("Utilizing external etcd at %s", strings.Join(etcdCfg.Endpoints, ", "))
+		backend, backendErr := etcd.NewExternal(context.Background(), etcdCfg)
+		if backendErr != nil {
+			return nil, backendErr
+		}
+		database = etcd.NewDatabase(backend, etcdCfg.Namespace, etcdCfg.RequestTimeout)
+	default:
+		return nil, fmt.Errorf("unsupported locking-db-type %q; supported values are boltdb, redis, etcd", dbtype)
 	}
 
 	noOpLocker := locking.NewNoOpLocker()

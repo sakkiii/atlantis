@@ -1,0 +1,356 @@
+// Copyright 2017 HootSuite Media Inc.
+// SPDX-License-Identifier: Apache-2.0
+// Modified hereafter by contributors to runatlantis/atlantis.
+//
+// This file implements the host-aware scoped project-lock store (design
+// §"Etcd database adapter"). The legacy db.Database project-lock methods omit
+// the VCS hostname, so the etcd HA path uses this supplemental contract, which
+// carries an exact ProjectScope/PullScope through every operation. Etcd mode
+// never invokes an ambiguous legacy project-lock operation.
+package etcd
+
+import (
+	"context"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/runatlantis/atlantis/server/events/models"
+	clientv3 "go.etcd.io/etcd/client/v3"
+)
+
+const (
+	lockRecordKind = "project-lock"
+	lockRecordV1   = 1
+
+	lifecycleRecordKind = "pull-lifecycle"
+	lifecycleRecordV1   = 1
+
+	// uiLockIDVersion prefixes the opaque UI lock ID so its decoder can never
+	// fall back to the legacy models.GenerateLockKey parser (design §428).
+	uiLockIDVersion = "e1"
+)
+
+// LifecycleState is the state of a pull-scoped lock lifecycle record (design §442).
+type LifecycleState string
+
+const (
+	LifecycleOpen     LifecycleState = "open"
+	LifecycleCleaning LifecycleState = "cleaning"
+	LifecycleClosed   LifecycleState = "closed"
+)
+
+// lifecycleRecord tracks whether a pull is accepting new project locks. A
+// generation advances on close/reopen so delayed deliveries cannot resurrect a
+// stale state (design §450).
+type lifecycleRecord struct {
+	State      LifecycleState `json:"state"`
+	Generation int64          `json:"generation"`
+}
+
+// ScopedProjectLockStore is the host-aware project-lock contract used by all
+// etcd project-lock call sites (design §80).
+type ScopedProjectLockStore interface {
+	AcquireProjectLock(ctx context.Context, scope ProjectScope, lock models.ProjectLock) (acquired bool, current models.ProjectLock, err error)
+	GetProjectLock(ctx context.Context, scope ProjectScope) (*models.ProjectLock, error)
+	UnlockProjectScope(ctx context.Context, scope ProjectScope) (*models.ProjectLock, error)
+	UnlockIfOwnedByPull(ctx context.Context, scope ProjectScope, pullNum int) (*models.ProjectLock, error)
+	ListProjectLocks(ctx context.Context) ([]models.ProjectLock, error)
+	UnlockByPullScope(ctx context.Context, scope PullScope, closeGen bool) ([]models.ProjectLock, error)
+	UILockID(scope ProjectScope) string
+	DecodeUILockID(id string) (ProjectScope, error)
+}
+
+// scopedLockStore is the etcd implementation of ScopedProjectLockStore.
+type scopedLockStore struct {
+	kv   clientv3.KV
+	keys Keyspace
+}
+
+// AcquireProjectLock acquires a project lock with a create-only transaction
+// (design §434: CreateRevision(key) == 0). It additionally refuses acquisition
+// while the pull's lifecycle record is in the cleaning state (design §442).
+func (s *scopedLockStore) AcquireProjectLock(ctx context.Context, scope ProjectScope, lock models.ProjectLock) (bool, models.ProjectLock, error) {
+	key := s.keys.ProjectLockKey(scope)
+	cleaningKey := s.keys.PullCleaningKey(PullScope{VCSHostname: scope.VCSHostname, Repository: scope.Repository, PullNum: lock.Pull.Num})
+
+	val, err := encodeValue(lockRecordKind, lockRecordV1, lock)
+	if err != nil {
+		return false, models.ProjectLock{}, err
+	}
+
+	// The transaction commits only when the lock key does not yet exist AND no
+	// cleaning is in progress for this pull. Both are expressed as
+	// CreateRevision==0 (key absence), which is reliable in an etcd transaction;
+	// a Value comparison on a possibly-absent key is not. Asserting the cleaning
+	// key inside the same transaction closes the race against UnlockByPullScope.
+	resp, err := s.kv.Txn(ctx).
+		If(
+			clientv3.Compare(clientv3.CreateRevision(key), "=", 0),
+			clientv3.Compare(clientv3.CreateRevision(cleaningKey), "=", 0),
+		).
+		Then(clientv3.OpPut(key, string(val))).
+		Else(clientv3.OpGet(key)).
+		Commit()
+	if err != nil {
+		return false, models.ProjectLock{}, fmt.Errorf("acquiring project lock: %w", err)
+	}
+	if resp.Succeeded {
+		return true, lock, nil
+	}
+
+	// Not acquired: report why. If a lock exists, return the current holder;
+	// otherwise the pull is mid-cleanup and acquisition is refused.
+	getLock := resp.Responses[0].GetResponseRange()
+	if len(getLock.Kvs) == 0 {
+		return false, models.ProjectLock{}, errPullCleaning
+	}
+	var current models.ProjectLock
+	if err := decodeValue(getLock.Kvs[0].Value, lockRecordKind, lockRecordV1, lockRecordV1, &current); err != nil {
+		return false, models.ProjectLock{}, err
+	}
+	return false, current, nil
+}
+
+// errPullCleaning is returned when a project lock cannot be acquired because the
+// pull is being cleaned up. Callers treat it as fail-closed.
+var errPullCleaning = errors.New("pull is being cleaned up; project lock acquisition is refused")
+
+// GetProjectLock returns the lock at scope, or nil if absent.
+func (s *scopedLockStore) GetProjectLock(ctx context.Context, scope ProjectScope) (*models.ProjectLock, error) {
+	resp, err := s.kv.Get(ctx, s.keys.ProjectLockKey(scope))
+	if err != nil {
+		return nil, fmt.Errorf("getting project lock: %w", err)
+	}
+	if len(resp.Kvs) == 0 {
+		return nil, nil
+	}
+	lock, err := decodeLock(resp.Kvs[0].Value)
+	if err != nil {
+		return nil, err
+	}
+	return &lock, nil
+}
+
+// UnlockProjectScope deletes the lock at scope and returns it, or nil if absent.
+// Deletion is conditional on the exact observed revision so a concurrent
+// re-lock is never clobbered (design §436).
+func (s *scopedLockStore) UnlockProjectScope(ctx context.Context, scope ProjectScope) (*models.ProjectLock, error) {
+	key := s.keys.ProjectLockKey(scope)
+	get, err := s.kv.Get(ctx, key)
+	if err != nil {
+		return nil, fmt.Errorf("reading project lock for unlock: %w", err)
+	}
+	if len(get.Kvs) == 0 {
+		return nil, nil
+	}
+	lock, err := decodeLock(get.Kvs[0].Value)
+	if err != nil {
+		return nil, err
+	}
+	rev := get.Kvs[0].ModRevision
+	resp, err := s.kv.Txn(ctx).
+		If(clientv3.Compare(clientv3.ModRevision(key), "=", rev)).
+		Then(clientv3.OpDelete(key)).
+		Commit()
+	if err != nil {
+		return nil, fmt.Errorf("deleting project lock: %w", err)
+	}
+	if !resp.Succeeded {
+		// The lock changed under us; treat as no-op rather than deleting a newer
+		// lock.
+		return nil, nil
+	}
+	return &lock, nil
+}
+
+// UnlockIfOwnedByPull deletes the lock only when it is still held by pullNum,
+// comparing the exact stored owner and revision (design §436).
+func (s *scopedLockStore) UnlockIfOwnedByPull(ctx context.Context, scope ProjectScope, pullNum int) (*models.ProjectLock, error) {
+	key := s.keys.ProjectLockKey(scope)
+	get, err := s.kv.Get(ctx, key)
+	if err != nil {
+		return nil, fmt.Errorf("reading project lock: %w", err)
+	}
+	if len(get.Kvs) == 0 {
+		return nil, nil
+	}
+	lock, err := decodeLock(get.Kvs[0].Value)
+	if err != nil {
+		return nil, err
+	}
+	if lock.Pull.Num != pullNum {
+		return nil, nil
+	}
+	rev := get.Kvs[0].ModRevision
+	resp, err := s.kv.Txn(ctx).
+		If(clientv3.Compare(clientv3.ModRevision(key), "=", rev)).
+		Then(clientv3.OpDelete(key)).
+		Commit()
+	if err != nil {
+		return nil, fmt.Errorf("deleting project lock: %w", err)
+	}
+	if !resp.Succeeded {
+		return nil, nil
+	}
+	return &lock, nil
+}
+
+// ListProjectLocks returns every project lock, paginating with all pages pinned
+// to the first response revision so a concurrent write cannot make an entry
+// appear twice or be skipped (design §454).
+func (s *scopedLockStore) ListProjectLocks(ctx context.Context) ([]models.ProjectLock, error) {
+	var out []models.ProjectLock
+	err := s.rangePinned(ctx, s.keys.ProjectLockPrefix(), func(kv *mvccKV) error {
+		lock, err := decodeLock(kv.Value)
+		if err != nil {
+			return err
+		}
+		out = append(out, lock)
+		return nil
+	})
+	return out, err
+}
+
+// UnlockByPullScope removes every project lock for a pull. It first publishes a
+// cleaning lifecycle record that acquisition transactions observe, then ranges
+// the project-lock namespace pinned to one revision, conditionally deleting each
+// lock owned by the pull. It finishes by advancing the lifecycle to open (manual
+// cleanup) or closed (pull-close cleanup) (design §442).
+func (s *scopedLockStore) UnlockByPullScope(ctx context.Context, scope PullScope, closeGen bool) ([]models.ProjectLock, error) {
+	if err := s.beginCleaning(ctx, scope); err != nil {
+		return nil, err
+	}
+
+	var removed []models.ProjectLock
+	err := s.rangePinned(ctx, s.keys.ProjectLockPrefix(), func(kv *mvccKV) error {
+		lock, err := decodeLock(kv.Value)
+		if err != nil {
+			return err
+		}
+		if lock.Pull.Num != scope.PullNum ||
+			lock.Project.RepoFullName != scope.Repository ||
+			lock.Pull.BaseRepo.VCSHost.Hostname != scope.VCSHostname {
+			return nil
+		}
+		// Conditionally delete only this exact revision.
+		resp, derr := s.kv.Txn(ctx).
+			If(clientv3.Compare(clientv3.ModRevision(string(kv.Key)), "=", kv.ModRevision)).
+			Then(clientv3.OpDelete(string(kv.Key))).
+			Commit()
+		if derr != nil {
+			return fmt.Errorf("deleting project lock during pull cleanup: %w", derr)
+		}
+		if resp.Succeeded {
+			removed = append(removed, lock)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.finishCleaning(ctx, scope, closeGen); err != nil {
+		return removed, err
+	}
+	return removed, nil
+}
+
+// beginCleaning marks a pull as being cleaned up by creating the cleaning key,
+// which acquisition transactions observe as absence-of-cleaning failing.
+func (s *scopedLockStore) beginCleaning(ctx context.Context, scope PullScope) error {
+	if _, err := s.kv.Put(ctx, s.keys.PullCleaningKey(scope), "1"); err != nil {
+		return fmt.Errorf("marking pull cleaning: %w", err)
+	}
+	return nil
+}
+
+// finishCleaning clears the cleaning marker and records the persistent lifecycle
+// generation: open for manual cleanup, or a closed generation for pull-close
+// cleanup (design §442). The reopen path (Phase 1.2 follow-up) advances a closed
+// generation back to a new open generation with compare-and-swap.
+func (s *scopedLockStore) finishCleaning(ctx context.Context, scope PullScope, closeGen bool) error {
+	state := LifecycleOpen
+	if closeGen {
+		state = LifecycleClosed
+	}
+	val, err := encodeValue(lifecycleRecordKind, lifecycleRecordV1, lifecycleRecord{State: state})
+	if err != nil {
+		return err
+	}
+	// Record the lifecycle generation, then drop the cleaning marker so new
+	// acquisitions are permitted (open) or the closed record stands (closed).
+	if _, err := s.kv.Txn(ctx).
+		Then(
+			clientv3.OpPut(s.keys.PullLifecycleKey(scope), string(val)),
+			clientv3.OpDelete(s.keys.PullCleaningKey(scope)),
+		).Commit(); err != nil {
+		return fmt.Errorf("finishing pull cleanup: %w", err)
+	}
+	return nil
+}
+
+// UILockID returns a versioned opaque encoding of the scope for the lock UI. It
+// includes the VCS hostname and cannot be parsed by the legacy decoder.
+func (s *scopedLockStore) UILockID(scope ProjectScope) string {
+	return uiLockIDVersion + "." + encodeProjectScope(scope)
+}
+
+// DecodeUILockID reverses UILockID. It refuses any value not carrying the etcd
+// version prefix; there is no legacy fallback (design §428).
+func (s *scopedLockStore) DecodeUILockID(id string) (ProjectScope, error) {
+	prefix := uiLockIDVersion + "."
+	if !strings.HasPrefix(id, prefix) {
+		return ProjectScope{}, fmt.Errorf("not an etcd UI lock id: %q", id)
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(id, prefix))
+	if err != nil {
+		return ProjectScope{}, fmt.Errorf("decoding UI lock id: %w", err)
+	}
+	fields, err := canonicalDecode(raw, 5)
+	if err != nil {
+		return ProjectScope{}, err
+	}
+	return ProjectScope{
+		VCSHostname: fields[0], Repository: fields[1], Path: fields[2],
+		Project: fields[3], Workspace: fields[4],
+	}, nil
+}
+
+func decodeLock(data []byte) (models.ProjectLock, error) {
+	var lock models.ProjectLock
+	if err := decodeValue(data, lockRecordKind, lockRecordV1, lockRecordV1, &lock); err != nil {
+		return models.ProjectLock{}, err
+	}
+	lock.Time = lock.Time.Local()
+	return lock, nil
+}
+
+// canonicalDecode reverses canonicalEncode's length-prefixed serialization,
+// requiring exactly want fields.
+func canonicalDecode(raw []byte, want int) ([]string, error) {
+	s := string(raw)
+	fields := make([]string, 0, want)
+	for len(s) > 0 {
+		colon := strings.IndexByte(s, ':')
+		if colon < 0 {
+			return nil, errors.New("malformed canonical encoding: missing length delimiter")
+		}
+		n, err := strconv.Atoi(s[:colon])
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("malformed canonical encoding: bad length %q", s[:colon])
+		}
+		s = s[colon+1:]
+		if len(s) < n {
+			return nil, errors.New("malformed canonical encoding: truncated field")
+		}
+		fields = append(fields, s[:n])
+		s = s[n:]
+	}
+	if len(fields) != want {
+		return nil, fmt.Errorf("expected %d fields, got %d", want, len(fields))
+	}
+	return fields, nil
+}

@@ -696,6 +696,136 @@ It's not supposed to be used with `--disable-apply-all`.
 The command `atlantis apply -p .*` will bypass the restriction and run apply on every project.
 :::
 
+### `--etcd-allow-insecure-dev`
+
+```bash
+atlantis server --etcd-allow-insecure-dev
+# or
+ATLANTIS_ETCD_ALLOW_INSECURE_DEV=true
+```
+
+Permit insecure (HTTP, no TLS) etcd connections for local development only. HTTP is accepted only for loopback addresses. Never enable in production. Only used when `--locking-db-type=etcd`.
+
+### `--etcd-ca-file`
+
+```bash
+atlantis server --etcd-ca-file="/path/to/ca.pem"
+# or
+ATLANTIS_ETCD_CA_FILE="/path/to/ca.pem"
+```
+
+Path to the trusted CA certificate for verifying the etcd client listener. Required in production etcd mode.
+
+### `--etcd-cert-file`
+
+```bash
+atlantis server --etcd-cert-file="/path/to/client.pem"
+# or
+ATLANTIS_ETCD_CERT_FILE="/path/to/client.pem"
+```
+
+Path to the Atlantis client certificate presented to etcd. Required in production etcd mode.
+
+### `--etcd-deployment-id`
+
+```bash
+atlantis server --etcd-deployment-id="<stable-uuid>"
+# or
+ATLANTIS_ETCD_DEPLOYMENT_ID="<stable-uuid>"
+```
+
+Stable unique identifier for this logical Atlantis installation, used to guard the etcd namespace. Generate it once and keep it stable across process restarts and database migrations.
+
+### `--etcd-endpoints`
+
+```bash
+atlantis server --etcd-endpoints="https://member-0:2379,https://member-1:2379"
+# or
+ATLANTIS_ETCD_ENDPOINTS="https://member-0:2379,https://member-1:2379"
+```
+
+Comma-separated https etcd client endpoints for external mode. Every production endpoint must use https and pass hostname verification.
+
+### `--etcd-key-file`
+
+```bash
+atlantis server --etcd-key-file="/path/to/client-key.pem"
+# or
+ATLANTIS_ETCD_KEY_FILE="/path/to/client-key.pem"
+```
+
+Path to the private key for the Atlantis etcd client certificate. Required in production etcd mode.
+
+### `--etcd-mode`
+
+```bash
+atlantis server --etcd-mode="external"
+# or
+ATLANTIS_ETCD_MODE="external"
+```
+
+etcd runtime mode when `--locking-db-type=etcd`. Either `external` (connect to an existing etcd cluster) or `embedded` (run an embedded etcd voter). Embedded mode is not yet implemented.
+
+### `--etcd-namespace`
+
+```bash
+atlantis server --etcd-namespace="/atlantis"
+# or
+ATLANTIS_ETCD_NAMESPACE="/atlantis"
+```
+
+etcd key namespace under which all Atlantis keys are written. Defaults to `/atlantis`. Assign a distinct namespace to each logical Atlantis deployment.
+
+### `--etcd-password-file`
+
+```bash
+atlantis server --etcd-password-file="/path/to/password"
+# or
+ATLANTIS_ETCD_PASSWORD_FILE="/path/to/password"
+```
+
+Path to a file containing the etcd RBAC password. Required when `--etcd-username` is set. mTLS remains mandatory even with username authentication.
+
+### `--etcd-request-timeout`
+
+```bash
+atlantis server --etcd-request-timeout="5s"
+# or
+ATLANTIS_ETCD_REQUEST_TIMEOUT="5s"
+```
+
+Timeout bounding individual etcd database, ownership, and readiness RPCs. Defaults to `5s`.
+
+### `--etcd-server-name`
+
+```bash
+atlantis server --etcd-server-name="etcd"
+# or
+ATLANTIS_ETCD_SERVER_NAME="etcd"
+```
+
+Expected server name for etcd TLS hostname verification.
+
+### `--etcd-startup-timeout`
+
+```bash
+atlantis server --etcd-startup-timeout="5m"
+# or
+ATLANTIS_ETCD_STARTUP_TIMEOUT="5m"
+```
+
+Timeout bounding initial etcd connectivity and embedded quorum formation. Defaults to `5m`. Deployment startup probes must allow at least the same interval.
+
+### `--etcd-username`
+
+```bash
+atlantis server --etcd-username="atlantis"
+# or
+ATLANTIS_ETCD_USERNAME="atlantis"
+```
+
+etcd RBAC username. When set, requires `--etcd-password-file`; mTLS remains mandatory.
+
 ### `--executable-name` <Badge text="v0.42.0+" type="info"/>
 
 ```bash
