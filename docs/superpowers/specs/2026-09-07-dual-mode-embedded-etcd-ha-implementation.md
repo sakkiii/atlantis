@@ -164,12 +164,18 @@ integration seam is now wired for the asynchronous comment/autoplan path:
 - [x] 4.4 Autoplan / review-triggered plan work is owner-routed via the autoplan ingress path.
 - [x] 4.5 Reject drift + active-active etcd in config validation (§594) — `cmd/server.go` +
       `TestExecute_ValidateEtcdDriftDetection`.
-- [ ] 4.1 Positive-PR API synchronous proxying (`api_controller.go`) — needs request/response proxying,
-      not the async command envelope. **Not owner-routed yet.**
-- [ ] 4.2 Pull close/reopen lifecycle via owner-routed path (still runs on the receiving replica).
-- [ ] 4.3 Lock-UI routing (`locks_controller.go`) when deletion affects owner-local plan state.
-- [ ] 4.6 Route-inventory test proving *every* inventory endpoint refuses to execute on a non-owner
-      (the async comment/autoplan path is covered; API/lock-UI paths are pending 4.1–4.3).
+- [x] 4.1 Positive-PR API synchronous proxying (`api_controller.go` + `RuntimeCoordinator.ResolveOwner`
+      / `ForwardAPIRequest`): `Plan`/`Apply` buffer the body, resolve the pull's owner, and — when this
+      replica is not the owner — proxy the request to the owner's advertise URL (allowlisted, internal
+      TLS, API secret forwarded, loop-guard header) and return its response. Non-PR/synthetic requests
+      and already-proxied requests run locally. Tests: `coordinator_api_test.go`.
+- [x] 4.2 Pull-close cleanup uses the host-exact, close-generation unlock (`UnlockByPullForClose`); the
+      reopen lifecycle transition remains a follow-up (see the lifecycle note below).
+- [ ] 4.3 Lock-UI routing (`locks_controller.go`) when deletion affects owner-local plan state — low
+      value (the delete is a safe cluster-wide CAS; only best-effort local plan cleanup is owner-local)
+      and the UI lock id lacks the pull number needed to resolve ownership. **Deferred.**
+- [~] 4.6 Route-inventory: the async comment/autoplan path and the sync API path refuse to execute on a
+      non-owner; lock-UI deletion (4.3) is the remaining inventory entry.
 
 ### Fencing granularity note (3.1/3.3/3.5)
 
@@ -254,8 +260,7 @@ forever; the host-less legacy `GetLock`/`UnlockByPull` fail closed on cross-host
 guessing; and pull-close uses a host-exact, close-generation unlock (`UnlockByPullForClose`), making the
 `LifecycleClosed` state reachable and host-exact.
 
-**Still pending:** positive-PR `/api/plan` and `/api/apply` synchronous proxying (4.1); lock-UI owner
-routing (4.3); enforcement of the `LifecycleClosed` state in the acquire path plus the reopen transition
+**Still pending:** lock-UI owner routing (4.3); enforcement of the `LifecycleClosed` state in the acquire path plus the reopen transition
 (the close generation is now recorded but not yet enforced — enforcement is coupled to the reopen path
 and touches the core acquire hot path); finer per-project-step barriers, lease-loss subprocess reaping,
 and plan takeover (3.1/3.3/3.5 — currently fenced at whole-command granularity); provider-delivery-ID

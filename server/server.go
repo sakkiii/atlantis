@@ -1178,6 +1178,12 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		SilenceVCSStatusNoProjects:      userConfig.SilenceVCSStatusNoProjects,
 	}
 
+	if etcdRuntime != nil {
+		// Positive-PR API plan/apply requests are proxied to the owning replica in
+		// etcd (active-active HA) mode.
+		apiController.OwnerProxy = etcd.NewRuntimeCoordinator(etcdRuntime)
+	}
+
 	if userConfig.EnableDriftDetection {
 		logger.Info("Drift detection is enabled")
 		driftStorage := drift.NewInMemoryStorage()

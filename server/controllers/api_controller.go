@@ -4,6 +4,8 @@
 package controllers
 
 import (
+	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -81,11 +83,85 @@ type APIController struct {
 	// SilenceVCSStatusNoProjects is whether API should set commit status if no projects are found
 	SilenceVCSStatusNoProjects bool
 
+	// OwnerProxy is set only in etcd (active-active HA) mode. When set, positive-PR
+	// API plan/apply requests are proxied to the replica that owns the pull request
+	// so a given pull's synchronous work runs on exactly one replica.
+	OwnerProxy APIOwnerProxy
+
 	// apiMiddleware provides common authentication and response utilities.
 	// Initialized lazily via getAPIMiddleware() with sync.Once for thread safety.
 	apiMiddleware           *APIMiddleware
 	apiMiddlewareOnce       sync.Once
 	driftFullDetectionLocks sync.Map
+}
+
+// APIOwnerProxy resolves the owner of a pull request and proxies a synchronous
+// API request to it. It is implemented by the etcd runtime coordinator; nil in
+// non-etcd mode.
+type APIOwnerProxy interface {
+	// ResolveOwner returns local=true when this replica should handle the request,
+	// or the owning replica's advertise URL to proxy to.
+	ResolveOwner(ctx context.Context, vcsHostname, repoFullName string, pullNum int) (local bool, advertiseURL string, err error)
+	// ForwardAPIRequest proxies the request body to advertiseURL+path and returns
+	// the owner's status code and response body.
+	ForwardAPIRequest(ctx context.Context, advertiseURL, path, apiToken string, body []byte) (status int, respBody []byte, err error)
+}
+
+// internalProxiedHeader marks an API request already proxied to the owner, so the
+// owning replica handles it locally rather than forwarding again (loop guard). It
+// mirrors etcd.InternalProxiedHeader without importing the package here.
+const internalProxiedHeader = "X-Atlantis-Internal-Proxied"
+
+// maybeProxyToOwner routes a positive-PR API request to its owning replica in
+// etcd mode. It returns handled=true when the request was proxied (the response
+// has been written); the caller then returns. It returns handled=false to run
+// locally. bodyBytes is the buffered request body (for replay when proxying).
+func (a *APIController) maybeProxyToOwner(w http.ResponseWriter, r *http.Request, path string, request *APIRequest, ctx *command.Context, bodyBytes []byte) bool {
+	if a.OwnerProxy == nil {
+		return false
+	}
+	// Only positive-PR requests have a stable pull identity to route by; synthetic
+	// non-PR (ad-hoc/drift) requests get a fresh pull number per call and are not
+	// owner-routed.
+	if request.PR <= 0 {
+		return false
+	}
+	// Loop guard: a request already proxied to us is handled locally.
+	if r.Header.Get(internalProxiedHeader) != "" {
+		return false
+	}
+
+	local, advertiseURL, err := a.OwnerProxy.ResolveOwner(r.Context(), ctx.HeadRepo.VCSHost.Hostname, ctx.HeadRepo.FullName, ctx.Pull.Num)
+	if err != nil {
+		a.Logger.Err("etcd API routing: resolving owner for %s#%d: %s", ctx.HeadRepo.FullName, ctx.Pull.Num, err)
+		a.apiReportLegacyError(w, http.StatusServiceUnavailable, fmt.Errorf("could not resolve pull request owner across HA replicas: %w", err))
+		return true
+	}
+	if local {
+		return false
+	}
+
+	status, respBody, err := a.OwnerProxy.ForwardAPIRequest(r.Context(), advertiseURL, path, r.Header.Get(atlantisTokenHeader), bodyBytes)
+	if err != nil {
+		a.Logger.Err("etcd API routing: proxying %s to owner %s: %s", path, advertiseURL, err)
+		a.apiReportLegacyError(w, http.StatusServiceUnavailable, fmt.Errorf("could not proxy request to pull request owner: %w", err))
+		return true
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(respBody)
+	return true
+}
+
+// bufferBody reads and restores the request body so it can be both parsed and
+// replayed when proxying.
+func bufferBody(r *http.Request) ([]byte, error) {
+	b, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, err
+	}
+	r.Body = io.NopCloser(bytes.NewReader(b))
+	return b, nil
 }
 
 type driftFullDetectionLockKey struct {
@@ -283,9 +359,17 @@ func (a *APIController) Plan(w http.ResponseWriter, r *http.Request) {
 	middleware := a.getAPIMiddleware()
 	responder := middleware.Responder
 
+	bodyBytes, err := bufferBody(r)
+	if err != nil {
+		a.apiReportLegacyError(w, http.StatusBadRequest, fmt.Errorf("failed to read request"))
+		return
+	}
 	request, ctx, code, err := a.apiParseAndValidate(r)
 	if err != nil {
 		a.apiReportLegacyError(w, code, err)
+		return
+	}
+	if a.maybeProxyToOwner(w, r, "/api/plan", request, ctx, bodyBytes) {
 		return
 	}
 
@@ -316,9 +400,17 @@ func (a *APIController) Apply(w http.ResponseWriter, r *http.Request) {
 	middleware := a.getAPIMiddleware()
 	responder := middleware.Responder
 
+	bodyBytes, err := bufferBody(r)
+	if err != nil {
+		a.apiReportLegacyError(w, http.StatusBadRequest, fmt.Errorf("failed to read request"))
+		return
+	}
 	request, ctx, code, err := a.apiParseAndValidate(r)
 	if err != nil {
 		a.apiReportLegacyError(w, code, err)
+		return
+	}
+	if a.maybeProxyToOwner(w, r, "/api/apply", request, ctx, bodyBytes) {
 		return
 	}
 

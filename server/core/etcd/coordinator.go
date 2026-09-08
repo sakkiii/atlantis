@@ -14,10 +14,25 @@
 package etcd
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
+
+// maxProxiedAPIResponseBytes bounds a synchronously proxied API response. API
+// plan/apply output can be large, so this is far higher than the internal command
+// envelope limit, while still capping a misbehaving peer.
+const maxProxiedAPIResponseBytes = 64 << 20 // 64 MiB
+
+// InternalProxiedHeader marks a synchronously proxied API request so the owning
+// replica handles it locally instead of forwarding again (loop prevention).
+const InternalProxiedHeader = "X-Atlantis-Internal-Proxied"
 
 // ExecuteOutcome reports why Execute did or did not run an admitted command. The
 // runner uses it to decide whether to surface a fail-closed message to the user.
@@ -59,6 +74,69 @@ func NewRuntimeCoordinator(rt *Runtime) *RuntimeCoordinator {
 func (c *RuntimeCoordinator) Route(ctx context.Context, cmd Command) (Result, error) {
 	return c.rt.Route(ctx, cmd)
 }
+
+// ResolveOwner resolves (claiming if unowned) the owner of a pull for
+// synchronous API proxying. It returns local=true when this replica should
+// handle the request itself; otherwise it returns the owning replica's internal
+// advertise URL to proxy to.
+func (c *RuntimeCoordinator) ResolveOwner(ctx context.Context, vcsHostname, repoFullName string, pullNum int) (bool, string, error) {
+	scope := PullScope{VCSHostname: vcsHostname, Repository: repoFullName, PullNum: pullNum}
+	claim, won, err := c.rt.ownership.Claim(ctx, scope)
+	if err != nil {
+		return false, "", err
+	}
+	if won || claim.Record.InstanceID == c.rt.ownership.InstanceID() {
+		return true, "", nil
+	}
+	return false, claim.AdvertiseURL(), nil
+}
+
+// ForwardAPIRequest proxies a synchronous API request (path is /api/plan or
+// /api/apply) to the owning replica's advertise URL and returns the owner's
+// status and response body. The destination host must be allowlisted; the API
+// secret is forwarded so the owner authenticates the call, and a proxied marker
+// header prevents the owner from forwarding again. It uses the internal TLS
+// configuration (nil only in insecure development).
+func (c *RuntimeCoordinator) ForwardAPIRequest(ctx context.Context, advertiseURL, path, apiToken string, body []byte) (int, []byte, error) {
+	u, err := url.Parse(advertiseURL)
+	if err != nil {
+		return 0, nil, fmt.Errorf("parsing advertise url: %w", err)
+	}
+	if c.rt.allowlist != nil && !c.rt.allowlist.Allows(u.Hostname()) {
+		return 0, nil, fmt.Errorf("forwarding destination %q is not allowlisted", u.Hostname())
+	}
+
+	endpoint := strings.TrimRight(advertiseURL, "/") + path
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(atlantisAPITokenHeader, apiToken)
+	req.Header.Set(InternalProxiedHeader, "1")
+
+	client := &http.Client{
+		Timeout: c.rt.cfg.StartupTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return errors.New("internal transport does not follow redirects")
+		},
+		Transport: &http.Transport{TLSClientConfig: c.rt.internalTLS},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("forwarding API request: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxProxiedAPIResponseBytes))
+	if err != nil {
+		return 0, nil, fmt.Errorf("reading proxied API response: %w", err)
+	}
+	return resp.StatusCode, respBody, nil
+}
+
+// atlantisAPITokenHeader is the header carrying the API secret, mirrored from the
+// controllers package so the proxied request authenticates at the owner.
+const atlantisAPITokenHeader = "X-Atlantis-Token"
 
 // Execute is the owner-side entry point invoked from the local executor once a
 // command has been admitted (locally or via forwarding). It establishes an
