@@ -211,11 +211,8 @@ generation into the project contexts and a cancellable exec path, and remain fol
       empty-target check), create-only record import (project locks/statuses/global locks), running
       count + order-independent checksum, atomic `Complete` writing schema+deployment/epoch under the
       manifest revision. Interrupted migration → normal startup refuses (proven). (§879)
-- [x] 6.1b Operable migration CLI (`cmd/migrate_etcd.go` + `boltdb.ListPullStatuses`): `atlantis
-      migrate-etcd` reads a BoltDB data-dir (project locks, pull statuses, global command locks), and in
-      `--dry-run` prints the cutover plan or, live, drives `etcd.Migrator` (BeginMigration → create-only
-      imports with exact scopes → Complete) against an external cluster. Fail-closed: a conflict aborts
-      and instructs discarding the target namespace.
+- [ ] 6.1b Operable migration CLI (BoltDB→etcd cutover driver over `etcd.Migrator`). **Not required for
+      now** — the `Migrator` library exists and is tested; the operator-facing CLI is deferred.
 - [x] 6.2 Recovery quarantine (`quarantine.go` + tests): `QuarantineStore` set (create-only) / IsActive
       / Clear (exact-recovery-ID CAS); every executable admission checks it. Fresh epoch on migrate. (§852)
 - [x] Dedup-window cleaner (`AdmissionStore.CleanupExpired` + Runtime background sweep): terminal
