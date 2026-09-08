@@ -844,7 +844,11 @@ atlantis server --etcd-mode="external"
 ATLANTIS_ETCD_MODE="external"
 ```
 
-etcd runtime mode when `--locking-db-type=etcd`. Either `external` (connect to an existing etcd cluster) or `embedded` (run an embedded etcd voter). Embedded mode is not yet implemented.
+etcd runtime mode when `--locking-db-type=etcd`. Either `external` (connect to an existing etcd cluster) or `embedded` (run an embedded etcd voter).
+
+::: warning Active-active coverage
+`--locking-db-type=etcd` runs Atlantis active-active: every replica accepts webhooks, but each pull request has exactly one owner replica, and commands are forwarded to the owner over the internal command transport so a given pull request's work never runs on two replicas at once. Comment commands and autoplan are owner-routed and fenced today. The following are **not yet owner-routed** and should not be relied on across replicas: the positive-PR `/api/plan` and `/api/apply` endpoints, web lock deletion that affects plan state, and pull close/reopen cleanup. Embedded mode starts an embedded voter but does not yet validate the member identity manifest or consume a join membership ticket; prefer `external` mode for production. Drift detection is rejected in etcd mode because it has no distributed exclusion yet.
+:::
 
 ### `--etcd-namespace`
 

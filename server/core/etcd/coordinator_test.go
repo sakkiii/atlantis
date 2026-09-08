@@ -1,0 +1,193 @@
+// Copyright 2017 HootSuite Media Inc.
+// SPDX-License-Identifier: Apache-2.0
+// Modified hereafter by contributors to runatlantis/atlantis.
+
+package etcd_test
+
+import (
+	"context"
+	"net/http"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/runatlantis/atlantis/server/core/etcd"
+	. "github.com/runatlantis/atlantis/testing"
+)
+
+// coordExecutor mimics the real command router's executor: on Register it drives
+// the coordinator's Execute in a goroutine, running a recorded closure.
+type coordExecutor struct {
+	coord   *etcd.RuntimeCoordinator
+	mu      sync.Mutex
+	ran     map[string]int
+	outcome map[string]etcd.ExecuteOutcome
+	done    chan string
+	success bool
+}
+
+func newCoordExecutor(coord *etcd.RuntimeCoordinator, success bool) *coordExecutor {
+	return &coordExecutor{
+		coord:   coord,
+		ran:     map[string]int{},
+		outcome: map[string]etcd.ExecuteOutcome{},
+		done:    make(chan string, 8),
+		success: success,
+	}
+}
+
+func (e *coordExecutor) Register(_ context.Context, cmd etcd.Command) error {
+	go func() {
+		outcome := e.coord.Execute(cmd, func() bool {
+			e.mu.Lock()
+			e.ran[cmd.Identity.DeliveryID]++
+			e.mu.Unlock()
+			return e.success
+		})
+		e.mu.Lock()
+		e.outcome[cmd.Identity.DeliveryID] = outcome
+		e.mu.Unlock()
+		e.done <- cmd.Identity.DeliveryID
+	}()
+	return nil
+}
+
+func (e *coordExecutor) wait(t *testing.T) string {
+	t.Helper()
+	select {
+	case d := <-e.done:
+		return d
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for coordinator Execute")
+		return ""
+	}
+}
+
+func (e *coordExecutor) runCount(d string) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.ran[d]
+}
+
+func (e *coordExecutor) outcomeFor(d string) etcd.ExecuteOutcome {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.outcome[d]
+}
+
+// TestCoordinator_ExecuteRunsAndCompletes proves that a locally-admitted command
+// is fenced, run exactly once, and its admission record reaches a terminal state.
+func TestCoordinator_ExecuteRunsAndCompletes(t *testing.T) {
+	backend := startEmbeddedEtcd(t)
+	ctx := context.Background()
+	rt, err := etcd.NewRuntime(ctx, runtimeConfig(t, backend, "A", "http://127.0.0.1:4142"))
+	Ok(t, err)
+	t.Cleanup(func() { _ = rt.Close() })
+
+	coord := etcd.NewRuntimeCoordinator(rt)
+	exec := newCoordExecutor(coord, true)
+	rt.AttachExecutor(exec)
+
+	res, err := rt.Route(ctx, cmd("d1"))
+	Ok(t, err)
+	Equals(t, http.StatusAccepted, res.Status)
+
+	d := exec.wait(t)
+	Equals(t, "d1", d)
+	Equals(t, 1, exec.runCount("d1"))
+	Equals(t, etcd.ExecuteRan, exec.outcomeFor("d1"))
+
+	// The admission record should reach succeeded.
+	id := cmd("d1").Identity
+	deadline := time.Now().Add(5 * time.Second)
+	var state etcd.AdmissionState
+	for time.Now().Before(deadline) {
+		rec, gerr := rt.Admission().Get(ctx, id)
+		Ok(t, gerr)
+		if rec != nil {
+			state = rec.State()
+			if state == etcd.AdmissionSucceeded {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	Equals(t, etcd.AdmissionSucceeded, state)
+}
+
+// TestCoordinator_ExecuteRecordsFailure proves a run returning false lands the
+// admission record in the failed terminal state.
+func TestCoordinator_ExecuteRecordsFailure(t *testing.T) {
+	backend := startEmbeddedEtcd(t)
+	ctx := context.Background()
+	rt, err := etcd.NewRuntime(ctx, runtimeConfig(t, backend, "A", "http://127.0.0.1:4142"))
+	Ok(t, err)
+	t.Cleanup(func() { _ = rt.Close() })
+
+	coord := etcd.NewRuntimeCoordinator(rt)
+	exec := newCoordExecutor(coord, false)
+	rt.AttachExecutor(exec)
+
+	res, err := rt.Route(ctx, cmd("d1"))
+	Ok(t, err)
+	Equals(t, http.StatusAccepted, res.Status)
+	exec.wait(t)
+
+	id := cmd("d1").Identity
+	deadline := time.Now().Add(5 * time.Second)
+	var state etcd.AdmissionState
+	for time.Now().Before(deadline) {
+		rec, gerr := rt.Admission().Get(ctx, id)
+		Ok(t, gerr)
+		if rec != nil {
+			state = rec.State()
+			if state == etcd.AdmissionFailed {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	Equals(t, etcd.AdmissionFailed, state)
+}
+
+// TestCoordinator_ExecuteBlockedByOlderGeneration proves that an unresolved
+// barrier from an earlier owner generation blocks a new generation's execution:
+// the run function is never invoked and the outcome is ExecuteBlocked.
+func TestCoordinator_ExecuteBlockedByOlderGeneration(t *testing.T) {
+	backend := startEmbeddedEtcd(t)
+	keys := etcd.NewKeyspace("/atlantis")
+	ctx := context.Background()
+	epoch, err := etcd.InitOrValidateNamespace(ctx, backend.Client().KV, keys, "dep-1")
+	Ok(t, err)
+
+	rt, err := etcd.NewRuntime(ctx, runtimeConfig(t, backend, "A", "http://127.0.0.1:4142"))
+	Ok(t, err)
+	t.Cleanup(func() { _ = rt.Close() })
+
+	scope := etcd.PullScope{VCSHostname: "github.com", Repository: "o/r", PullNum: 1}
+
+	// Establish an active barrier for an older generation and leave it in place.
+	own, err := etcd.NewOwnershipStore(backend, keys, epoch, "old", "http://127.0.0.1:4999", 10*time.Second, 5*time.Second)
+	Ok(t, err)
+	t.Cleanup(func() { _ = own.Close() })
+	oldClaim, won, err := own.Claim(ctx, scope)
+	Ok(t, err)
+	Assert(t, won, "expected to win the pull claim")
+	barriers := etcd.NewExecutionBarrierStore(backend, keys, epoch, own.InstanceID())
+	_, err = barriers.StartStep(ctx, oldClaim, "old-exec")
+	Ok(t, err)
+
+	// A new generation (different create revision) attempts to execute.
+	coord := etcd.NewRuntimeCoordinator(rt)
+	newGen := etcd.Generation{Epoch: epoch, CreateRevision: oldClaim.Generation().CreateRevision + 1000}
+	blockedCmd := etcd.Command{
+		Identity:   etcd.CommandIdentity{SourceKind: "webhook", VCSHostname: "github.com", DeliveryID: "blocked"},
+		Scope:      scope,
+		Generation: newGen,
+	}
+
+	ran := false
+	outcome := coord.Execute(blockedCmd, func() bool { ran = true; return true })
+	Equals(t, etcd.ExecuteBlocked, outcome)
+	Assert(t, !ran, "a blocked execution must not run the command")
+}

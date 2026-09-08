@@ -214,31 +214,34 @@ const (
 	DefaultGiteaPageSize                = 30
 	DefaultGitlabHostname               = "gitlab.com"
 	DefaultLockingDBType                = "boltdb"
-	DefaultEtcdNamespace                = "/atlantis"
-	DefaultEtcdRequestTimeout           = "5s"
-	DefaultEtcdStartupTimeout           = "5m"
-	DefaultEtcdEmbeddedVoterCount       = 3
-	DefaultEtcdEmbeddedStartupPurpose   = "serve"
-	DefaultOwnershipTTLSeconds          = 30
-	DefaultLanguage                     = i18n.DefaultLanguage
-	DefaultLogLevel                     = "info"
-	DefaultIgnoreVCSStatusNames         = ""
-	DefaultMaxCommentsPerCommand        = 100
-	DefaultParallelPoolSize             = 15
-	DefaultStatsNamespace               = "atlantis"
-	DefaultPort                         = 4141
-	DefaultRedisDB                      = 0
-	DefaultRedisPort                    = 6379
-	DefaultRedisTLSEnabled              = false
-	DefaultRedisInsecureSkipVerify      = false
-	DefaultTFDistribution               = TFDistributionTerraform
-	DefaultTFDownloadURL                = "https://releases.hashicorp.com"
-	DefaultTFDownload                   = true
-	DefaultTFEHostname                  = "app.terraform.io"
-	DefaultVCSStatusName                = "atlantis"
-	DefaultWebBasicAuth                 = false
-	DefaultWebUsername                  = "atlantis"
-	DefaultWebPassword                  = "atlantis"
+	// LockingDBTypeEtcd is the --locking-db-type value that selects the
+	// active-active etcd coordination backend.
+	LockingDBTypeEtcd                 = "etcd"
+	DefaultEtcdNamespace              = "/atlantis"
+	DefaultEtcdRequestTimeout         = "5s"
+	DefaultEtcdStartupTimeout         = "5m"
+	DefaultEtcdEmbeddedVoterCount     = 3
+	DefaultEtcdEmbeddedStartupPurpose = "serve"
+	DefaultOwnershipTTLSeconds        = 30
+	DefaultLanguage                   = i18n.DefaultLanguage
+	DefaultLogLevel                   = "info"
+	DefaultIgnoreVCSStatusNames       = ""
+	DefaultMaxCommentsPerCommand      = 100
+	DefaultParallelPoolSize           = 15
+	DefaultStatsNamespace             = "atlantis"
+	DefaultPort                       = 4141
+	DefaultRedisDB                    = 0
+	DefaultRedisPort                  = 6379
+	DefaultRedisTLSEnabled            = false
+	DefaultRedisInsecureSkipVerify    = false
+	DefaultTFDistribution             = TFDistributionTerraform
+	DefaultTFDownloadURL              = "https://releases.hashicorp.com"
+	DefaultTFDownload                 = true
+	DefaultTFEHostname                = "app.terraform.io"
+	DefaultVCSStatusName              = "atlantis"
+	DefaultWebBasicAuth               = false
+	DefaultWebUsername                = "atlantis"
+	DefaultWebPassword                = "atlantis"
 )
 
 var stringFlags = map[string]stringFlag{
@@ -1356,6 +1359,16 @@ func (s *ServerCmd) validate(userConfig server.UserConfig) error {
 
 	if _, err := userConfig.ToWebhookHttpHeaders(); err != nil {
 		return fmt.Errorf("invalid --%s: %w", WebhookHttpHeaders, err)
+	}
+
+	if userConfig.LockingDBType == LockingDBTypeEtcd && userConfig.EnableDriftDetection {
+		// Drift detection uses repository/ref identities and process-local
+		// storage, which has no distributed exclusion under active-active etcd
+		// routing; two replicas could remediate the same drift. Reject the
+		// combination rather than silently permitting duplicate remediation
+		// (design §594). This restriction lifts when drift gets its own
+		// distributed exclusion and storage design.
+		return fmt.Errorf("--%s cannot be combined with --%s=%s; drift detection has no distributed exclusion for active-active etcd yet", EnableDriftDetectionFlag, LockingDBType, LockingDBTypeEtcd)
 	}
 
 	return nil

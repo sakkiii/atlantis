@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/runatlantis/atlantis/server/core/db"
 	"go.etcd.io/etcd/client/pkg/v3/transport"
@@ -181,6 +182,15 @@ func (rt *Runtime) Barriers() *ExecutionBarrierStore { return rt.barriers }
 
 // Quarantine exposes the recovery-quarantine store for command admission checks.
 func (rt *Runtime) Quarantine() *QuarantineStore { return rt.quarant }
+
+// Admission exposes the command-admission store so the owner-side executor can
+// advance a record through its running and terminal states after the router has
+// reserved and scheduled it (admission.go, design §512).
+func (rt *Runtime) Admission() *AdmissionStore { return rt.admission }
+
+// RequestTimeout is the bound on individual coordination RPCs, reused by the
+// executor for its fence and admission-lifecycle transactions.
+func (rt *Runtime) RequestTimeout() time.Duration { return rt.cfg.RequestTimeout }
 
 // Ready reports readiness: backend authority plus a live ownership session. In
 // maintenance mode it is never ready (design §714, §731).

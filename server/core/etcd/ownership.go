@@ -62,6 +62,21 @@ func (c Claim) Generation() Generation {
 // forwarding.
 func (c Claim) AdvertiseURL() string { return c.Record.AdvertiseURL }
 
+// ClaimFromGeneration reconstructs a minimal Claim from a pull scope and fencing
+// generation. It carries only the fields the execution-barrier path compares —
+// the scope, the coordination epoch, and the ownership key's creation revision —
+// and is used by the owner-side executor, which receives the generation in the
+// forwarded command envelope rather than a full ownership record. The barrier
+// transaction re-validates the live ownership key against this create revision,
+// so a stale generation cannot start a step (barrier.go StartStep, design §546).
+func ClaimFromGeneration(scope PullScope, gen Generation) Claim {
+	return Claim{
+		Scope:          scope,
+		Record:         ownershipRecord{Epoch: gen.Epoch},
+		CreateRevision: gen.CreateRevision,
+	}
+}
+
 // OwnershipStore manages this process's PR ownership claims over one session
 // lease.
 type OwnershipStore struct {

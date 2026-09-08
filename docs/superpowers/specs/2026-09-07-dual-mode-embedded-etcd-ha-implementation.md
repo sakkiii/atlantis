@@ -144,16 +144,41 @@ Phases 1→4 are a hard chain. Phase 5 depends only on Phase 0 and may run in pa
 - [ ] 3.5 Plan takeover (§688): clone + external-PlanStore restore w/ head-commit validation.
       **(Integration into `ensurePlanLoaded`.)**
 
-## Phase 4 — Entry-point coverage (WS5) — RELEASE GATE  *(integration seam — not started)*
+## Phase 4 — Entry-point coverage (WS5) — RELEASE GATE  *(comment/autoplan wired)*
 
-The dispatch primitives (`Router`, transport) are built and tested (Phase 2). Remaining is threading
-`Router.Route` into the real entry points, which is the invasive hot-path change the design gates:
-- [ ] 4.1 Positive-PR API synchronous proxying (`api_controller.go:282/315`).
-- [ ] 4.2 Pull close/reopen lifecycle via owner-routed path.
-- [ ] 4.3 Lock-UI routing (`locks_controller.go:105`).
-- [ ] 4.4 Review-triggered work routing.
-- [ ] 4.5 Reject drift + active-active etcd in config validation (§594).
-- [ ] 4.6 Route-inventory test proving no handler executes on an arbitrary replica (§986).
+The dispatch primitives (`Router`, transport) are built and tested (Phase 2). The command-pipeline
+integration seam is now wired for the asynchronous comment/autoplan path:
+- [x] **Command ingress + owner-side executor** (`server/events/etcd_routing.go` + `server/core/etcd/coordinator.go`):
+      `EtcdCommandRouter` decorates the `CommandRunner` used by the events controller. Every comment
+      command and autoplan is serialized into a credential-free `etcd.Command` and dispatched through
+      `RuntimeCoordinator.Route` (ownership resolve → local admit or forward). The router also implements
+      `etcd.Executor`: on the owning replica it fences the run with a generation-bound execution barrier
+      (`RuntimeCoordinator.Execute`), advances the admission record `scheduled→running→terminal`, and runs
+      the wrapped runner. Non-admitted results and blocked/claim-lost fenced executions fail closed with a
+      user-visible comment. Tests: `etcd_routing_test.go` (ingress + executor, fake coordinator),
+      `coordinator_test.go` (run-to-terminal + older-generation block, embedded etcd).
+- [x] **Server wiring** (`server/server.go`): the runtime is retained; `AttachExecutor` mounts the
+      internal command handler at `etcd.InternalCommandPath`; `/readyz` reports `runtime.Ready` (backend
+      authority + live ownership session); shutdown calls `runtime.Close`, releasing ownership before the
+      client closes.
+- [x] 4.4 Autoplan / review-triggered plan work is owner-routed via the autoplan ingress path.
+- [x] 4.5 Reject drift + active-active etcd in config validation (§594) — `cmd/server.go` +
+      `TestExecute_ValidateEtcdDriftDetection`.
+- [ ] 4.1 Positive-PR API synchronous proxying (`api_controller.go`) — needs request/response proxying,
+      not the async command envelope. **Not owner-routed yet.**
+- [ ] 4.2 Pull close/reopen lifecycle via owner-routed path (still runs on the receiving replica).
+- [ ] 4.3 Lock-UI routing (`locks_controller.go`) when deletion affects owner-local plan state.
+- [ ] 4.6 Route-inventory test proving *every* inventory endpoint refuses to execute on a non-owner
+      (the async comment/autoplan path is covered; API/lock-UI paths are pending 4.1–4.3).
+
+### Fencing granularity note (3.1/3.3/3.5)
+
+Execution barriers are established at whole-command granularity in `RuntimeCoordinator.Execute`, not at
+each §534 project-workflow boundary inside `project_command_runner.go`. This is sufficient for the
+cross-generation takeover invariant (a new owner generation is blocked while an older generation's
+command barrier is unresolved), and parallel same-generation commands proceed. Finer per-project-step
+barriers, lease-loss subprocess reaping, and plan takeover (3.1/3.3/3.5) require threading the claim
+generation into the project contexts and a cancellable exec path, and remain follow-ups.
 
 ## Phase 5 — Embedded runtime (WS2)
 
@@ -203,8 +228,15 @@ command HTTP handler; `Route` dispatches ingress; `Ready` = backend authority + 
 serve). Tests: full-stack assembly + DB round-trip, two-runtime end-to-end forward-to-owner dispatch,
 migrated-namespace validation. (Transport auth hardened: tolerant Bearer parse for the empty dev token.)
 
-**Still pending (the command-pipeline integration seam):** call `runtime.AttachExecutor` with an
-executor wrapping Atlantis's async scheduler and mount its handler on the internal listener; drive
-`/readyz` from `runtime.Ready`; call `runtime.Close` on shutdown; thread `runtime.Route` into the
-`command_runner.go` / API / lock-UI entry points (Phase 4 route-inventory gate) with the per-boundary
-barrier fencing (3.1/3.3/3.5). Embedded identity-manifest activation + join-ticket flow (5.2/5.3).
+**Command-pipeline integration seam — wired for comment/autoplan (Phase 4).** `server.go` now
+decorates the events-controller `CommandRunner` with `EtcdCommandRouter`, calls
+`runtime.AttachExecutor` with it, mounts the internal handler at `etcd.InternalCommandPath`, drives
+`/readyz` from `runtime.Ready`, and calls `runtime.Close` on shutdown (releasing ownership first).
+Comment commands and autoplan flow through `runtime.Route` → owner admit/forward → fenced
+`RuntimeCoordinator.Execute`.
+
+**Still pending:** positive-PR `/api/plan` and `/api/apply` synchronous proxying (4.1); pull
+close/reopen and lock-UI owner routing (4.2/4.3); finer per-project-step barriers, lease-loss
+subprocess reaping, and plan takeover (3.1/3.3/3.5 — currently fenced at whole-command granularity);
+provider-delivery-ID admission dedup (each ingress is currently a distinct admission); the 24h
+admission dedup-window cleaner; and embedded identity-manifest activation + join-ticket flow (5.2/5.3).

@@ -637,6 +637,33 @@ func TestExecute_ValidateLogLevel(t *testing.T) {
 	}
 }
 
+func TestExecute_ValidateEtcdDriftDetection(t *testing.T) {
+	t.Run("drift detection rejected with etcd locking", func(t *testing.T) {
+		c := setupWithDefaults(map[string]any{
+			LockingDBType:            LockingDBTypeEtcd,
+			EnableDriftDetectionFlag: true,
+		}, t)
+		err := c.Execute()
+		ErrEquals(t, "--enable-drift-detection cannot be combined with --locking-db-type=etcd; drift detection has no distributed exclusion for active-active etcd yet", err)
+	})
+
+	t.Run("drift detection allowed with default locking", func(t *testing.T) {
+		c := setupWithDefaults(map[string]any{
+			EnableDriftDetectionFlag: true,
+		}, t)
+		err := c.Execute()
+		Ok(t, err)
+	})
+
+	t.Run("etcd locking without drift detection passes validation", func(t *testing.T) {
+		c := setupWithDefaults(map[string]any{
+			LockingDBType: LockingDBTypeEtcd,
+		}, t)
+		err := c.Execute()
+		Ok(t, err)
+	})
+}
+
 func TestExecute_ValidateCheckoutStrategy(t *testing.T) {
 	c := setupWithDefaults(map[string]any{
 		CheckoutStrategyFlag: "invalid",
