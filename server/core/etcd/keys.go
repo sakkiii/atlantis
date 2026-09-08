@@ -125,8 +125,15 @@ func (k Keyspace) GlobalLockKey(name string) string {
 func (k Keyspace) OwnershipKey(s PullScope) string {
 	return k.root + "/ownership/pulls/" + encodePullScope(s)
 }
+
+// CommandPrefix ranges over every command-admission record for one coordination
+// epoch, used by the dedup-window cleaner.
+func (k Keyspace) CommandPrefix(epoch string) string {
+	return k.root + "/commands/" + encodeSegment(epoch) + "/"
+}
+
 func (k Keyspace) CommandKey(epoch, deliveryID string) string {
-	return k.root + "/commands/" + encodeSegment(epoch) + "/" + encodeSegment(deliveryID)
+	return k.CommandPrefix(epoch) + encodeSegment(deliveryID)
 }
 
 // ExecutionBarrierPrefix ranges over every barrier for one pull, across all

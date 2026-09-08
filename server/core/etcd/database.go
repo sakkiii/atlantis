@@ -59,7 +59,7 @@ func NewDatabase(backend Backend, namespace string, requestTimeout time.Duration
 		backend:        backend,
 		kv:             kv,
 		keys:           keys,
-		locks:          &scopedLockStore{kv: kv, keys: keys},
+		locks:          &scopedLockStore{kv: kv, lease: backend.Client().Lease, keys: keys},
 		requestTimeout: requestTimeout,
 	}
 }
@@ -145,23 +145,51 @@ func (d *EtcdDatabase) UnlockByPull(repoFullName string, pullNum int) ([]models.
 	return d.locks.UnlockByPullScope(ctx, scope, false)
 }
 
+// UnlockByPullForClose deletes every project lock for a closed pull and advances
+// the pull's lifecycle to closed. Unlike the legacy UnlockByPull it takes the
+// exact VCS hostname, so there is no scan and no cross-host ambiguity, and it
+// closes the lifecycle generation rather than leaving it open (design §442,
+// §450). The pull-close executor calls this in etcd mode; the other, host-less
+// UnlockByPull callers are non-close unlocks that must not close the generation.
+func (d *EtcdDatabase) UnlockByPullForClose(repoFullName, vcsHostname string, pullNum int) ([]models.ProjectLock, error) {
+	ctx, cancel := d.ctx()
+	defer cancel()
+	scope := PullScope{VCSHostname: vcsHostname, Repository: repoFullName, PullNum: pullNum}
+	return d.locks.UnlockByPullScope(ctx, scope, true)
+}
+
+// errAmbiguousHost is returned when a host-less legacy lookup matches locks on
+// more than one VCS host, so no host can be resolved without risking acting on
+// the wrong host's lock. Etcd call sites use the scoped API with an exact
+// hostname and never hit this; the legacy path fails closed rather than guess
+// (design §419: two hosts with identical repo names must stay isolated).
+var errAmbiguousHost = errors.New("host-less lookup matched locks on multiple VCS hosts; use the host-aware scoped API")
+
 // findScopeByProject resolves a ProjectScope from a host-less models.Project by
-// scanning existing locks. It returns the first match; in a single-host
-// deployment this is exact.
+// scanning existing locks. It returns the single match; if matches span more
+// than one VCS host it fails closed rather than returning an arbitrary one.
 func (d *EtcdDatabase) findScopeByProject(ctx context.Context, project models.Project, workspace string) (ProjectScope, bool, error) {
 	locks, err := d.locks.ListProjectLocks(ctx)
 	if err != nil {
 		return ProjectScope{}, false, err
 	}
-	for _, l := range locks {
+	var match *models.ProjectLock
+	for i := range locks {
+		l := &locks[i]
 		if l.Project.RepoFullName == project.RepoFullName &&
 			l.Project.Path == project.Path &&
 			l.Project.ProjectName == project.ProjectName &&
 			l.Workspace == workspace {
-			return projectScopeFromLock(l), true, nil
+			if match != nil && match.Pull.BaseRepo.VCSHost.Hostname != l.Pull.BaseRepo.VCSHost.Hostname {
+				return ProjectScope{}, false, errAmbiguousHost
+			}
+			match = l
 		}
 	}
-	return ProjectScope{}, false, nil
+	if match == nil {
+		return ProjectScope{}, false, nil
+	}
+	return projectScopeFromLock(*match), true, nil
 }
 
 func (d *EtcdDatabase) findPullScope(ctx context.Context, repoFullName string, pullNum int) (PullScope, bool, error) {
@@ -169,16 +197,21 @@ func (d *EtcdDatabase) findPullScope(ctx context.Context, repoFullName string, p
 	if err != nil {
 		return PullScope{}, false, err
 	}
+	var host string
+	found := false
 	for _, l := range locks {
 		if l.Project.RepoFullName == repoFullName && l.Pull.Num == pullNum {
-			return PullScope{
-				VCSHostname: l.Pull.BaseRepo.VCSHost.Hostname,
-				Repository:  repoFullName,
-				PullNum:     pullNum,
-			}, true, nil
+			if found && host != l.Pull.BaseRepo.VCSHost.Hostname {
+				return PullScope{}, false, errAmbiguousHost
+			}
+			host = l.Pull.BaseRepo.VCSHost.Hostname
+			found = true
 		}
 	}
-	return PullScope{}, false, nil
+	if !found {
+		return PullScope{}, false, nil
+	}
+	return PullScope{VCSHostname: host, Repository: repoFullName, PullNum: pullNum}, true, nil
 }
 
 // --- pull/project status (CAS merge, design §438) ---

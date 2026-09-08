@@ -31,6 +31,14 @@ const (
 	// uiLockIDVersion prefixes the opaque UI lock ID so its decoder can never
 	// fall back to the legacy models.GenerateLockKey parser (design §428).
 	uiLockIDVersion = "e1"
+
+	// cleaningLeaseTTLSeconds bounds how long a pull's cleaning marker can survive
+	// after the cleaning process dies without finishing. The marker is attached to
+	// this lease, so a crashed or hung cleanup self-heals instead of wedging the
+	// pull's lock acquisition forever. A single pull's project-lock set is small,
+	// so this is far longer than any real cleanup; the in-process error path drops
+	// the marker immediately via lease revoke and does not wait for expiry.
+	cleaningLeaseTTLSeconds = 300
 )
 
 // LifecycleState is the state of a pull-scoped lock lifecycle record (design §442).
@@ -65,8 +73,9 @@ type ScopedProjectLockStore interface {
 
 // scopedLockStore is the etcd implementation of ScopedProjectLockStore.
 type scopedLockStore struct {
-	kv   clientv3.KV
-	keys Keyspace
+	kv    clientv3.KV
+	lease clientv3.Lease
+	keys  Keyspace
 }
 
 // AcquireProjectLock acquires a project lock with a create-only transaction
@@ -220,12 +229,18 @@ func (s *scopedLockStore) ListProjectLocks(ctx context.Context) ([]models.Projec
 // lock owned by the pull. It finishes by advancing the lifecycle to open (manual
 // cleanup) or closed (pull-close cleanup) (design §442).
 func (s *scopedLockStore) UnlockByPullScope(ctx context.Context, scope PullScope, closeGen bool) ([]models.ProjectLock, error) {
-	if err := s.beginCleaning(ctx, scope); err != nil {
+	leaseID, err := s.beginCleaning(ctx, scope)
+	if err != nil {
 		return nil, err
 	}
+	// Revoke the cleaning lease on every exit. On the success path finishCleaning
+	// has already deleted the marker in a transaction, so this frees the now-empty
+	// lease; on any error path it deletes the marker immediately rather than
+	// waiting for the lease TTL, so a failed cleanup never wedges the pull.
+	defer func() { _, _ = s.lease.Revoke(context.Background(), leaseID) }()
 
 	var removed []models.ProjectLock
-	err := s.rangePinned(ctx, s.keys.ProjectLockPrefix(), func(kv *mvccKV) error {
+	err = s.rangePinned(ctx, s.keys.ProjectLockPrefix(), func(kv *mvccKV) error {
 		lock, err := decodeLock(kv.Value)
 		if err != nil {
 			return err
@@ -258,13 +273,22 @@ func (s *scopedLockStore) UnlockByPullScope(ctx context.Context, scope PullScope
 	return removed, nil
 }
 
-// beginCleaning marks a pull as being cleaned up by creating the cleaning key,
-// which acquisition transactions observe as absence-of-cleaning failing.
-func (s *scopedLockStore) beginCleaning(ctx context.Context, scope PullScope) error {
-	if _, err := s.kv.Put(ctx, s.keys.PullCleaningKey(scope), "1"); err != nil {
-		return fmt.Errorf("marking pull cleaning: %w", err)
+// beginCleaning marks a pull as being cleaned up by creating a cleaning key that
+// acquisition transactions observe as absence-of-cleaning failing. The key is
+// attached to a bounded lease so an interrupted cleanup (client deadline, etcd
+// blip, or a process crash) cannot leave the marker set forever and permanently
+// refuse the pull's lock acquisition. It returns the lease ID so the caller can
+// revoke it on completion.
+func (s *scopedLockStore) beginCleaning(ctx context.Context, scope PullScope) (clientv3.LeaseID, error) {
+	grant, err := s.lease.Grant(ctx, cleaningLeaseTTLSeconds)
+	if err != nil {
+		return 0, fmt.Errorf("granting cleaning lease: %w", err)
 	}
-	return nil
+	if _, err := s.kv.Put(ctx, s.keys.PullCleaningKey(scope), "1", clientv3.WithLease(grant.ID)); err != nil {
+		_, _ = s.lease.Revoke(context.Background(), grant.ID)
+		return 0, fmt.Errorf("marking pull cleaning: %w", err)
+	}
+	return grant.ID, nil
 }
 
 // finishCleaning clears the cleaning marker and records the persistent lifecycle

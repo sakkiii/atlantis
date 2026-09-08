@@ -238,6 +238,41 @@ func (a *AdmissionStore) casWrite(ctx context.Context, expectedRev int64, next a
 // caller re-reads and reconciles rather than blindly retrying.
 var errAdmissionConflict = errors.New("command admission record changed concurrently")
 
+// CleanupExpired compare-and-swap deletes every terminal (succeeded/failed)
+// command-admission record whose last update is older than DedupWindow, bounding
+// keyspace growth (design §647). Uncertain and non-terminal records are never
+// cleaned: uncertain persists until explicit resolution, and in-flight records
+// are still authoritative. Each delete is guarded by the record's mod revision so
+// a record advanced concurrently is left for the next pass. It returns the number
+// of records deleted.
+func (a *AdmissionStore) CleanupExpired(ctx context.Context, now time.Time) (int, error) {
+	cutoff := now.Add(-DedupWindow)
+	deleted := 0
+	err := rangePinned(ctx, a.kv, a.keys.CommandPrefix(a.epoch), func(kv *mvccKV) error {
+		rec, derr := decodeAdmission(kv.Value, kv.ModRevision)
+		if derr != nil {
+			// Skip records this binary cannot decode rather than deleting them.
+			return nil //nolint:nilerr
+		}
+		if !rec.Record.State.terminal() || !rec.Record.UpdatedAt.Before(cutoff) {
+			return nil
+		}
+		key := a.key(rec.Record.Identity)
+		resp, txErr := a.kv.Txn(ctx).
+			If(clientv3.Compare(clientv3.ModRevision(key), "=", kv.ModRevision)).
+			Then(clientv3.OpDelete(key)).
+			Commit()
+		if txErr != nil {
+			return fmt.Errorf("deleting expired command admission: %w", txErr)
+		}
+		if resp.Succeeded {
+			deleted++
+		}
+		return nil
+	})
+	return deleted, err
+}
+
 // validTransition enforces the state machine. Terminal and uncertain states are
 // sinks; the dedup cleaner deletes terminal records after the window.
 func validTransition(from, to AdmissionState) bool {

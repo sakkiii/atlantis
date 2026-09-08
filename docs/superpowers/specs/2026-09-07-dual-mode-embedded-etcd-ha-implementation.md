@@ -190,9 +190,14 @@ generation into the project contexts and a cancellable exec path, and remain fol
       bootstrap/join, non-empty for restart/restore); `StartEtcd` + `ReadyNotify`/`Err`/`ctx`/timeout;
       shared client + linearizable probe; backend `embeddedClose` waits for `StopNotify` (§716, §751).
       Cluster state derived from lifecycle, strict-reconfig + corrupt-check forced on.
-- [~] 5.2/5.3/5.6 Lifecycle data-dir preconditions + voter-count + peer-set validation done. **Remaining:**
-      identity-manifest read/validate + activation, join membership-ticket consumption, full multi-node
-      bootstrap→restart flow (needs multi-process infra; single-node `embed` path proven by test harness).
+- [x] 5.2/5.3 Lifecycle identity validation (`embedded_identity.go` + tests): parse+validate the identity
+      manifest / membership ticket / restore manifest per lifecycle before `StartEtcd`; on `restart`,
+      read the persisted WAL metadata and refuse startup if the on-disk cluster/member IDs do not match
+      the declared manifest (blocks a stale/cloned/wrong PVC → split-brain). Wired into `NewEmbedded`.
+- [~] 5.6 **Remaining:** atomic single-use consumption of a join membership ticket against the live
+      cluster (design §240/§719 step 2), heavy restore binding (snapshot-hash verification, revision-bump
+      receipts) which recovery tooling performs post-quorum, and the full multi-node bootstrap→restart
+      flow (needs multi-process infra; the single-node `embed` path is proven by the test harness).
 
 ## Phase 6 — Migration + operations (WS6)
 
@@ -200,8 +205,16 @@ generation into the project contexts and a cancellable exec path, and remain fol
       empty-target check), create-only record import (project locks/statuses/global locks), running
       count + order-independent checksum, atomic `Complete` writing schema+deployment/epoch under the
       manifest revision. Interrupted migration → normal startup refuses (proven). (§879)
+- [x] 6.1b Operable migration CLI (`cmd/migrate_etcd.go` + `boltdb.ListPullStatuses`): `atlantis
+      migrate-etcd` reads a BoltDB data-dir (project locks, pull statuses, global command locks), and in
+      `--dry-run` prints the cutover plan or, live, drives `etcd.Migrator` (BeginMigration → create-only
+      imports with exact scopes → Complete) against an external cluster. Fail-closed: a conflict aborts
+      and instructs discarding the target namespace.
 - [x] 6.2 Recovery quarantine (`quarantine.go` + tests): `QuarantineStore` set (create-only) / IsActive
       / Clear (exact-recovery-ID CAS); every executable admission checks it. Fresh epoch on migrate. (§852)
+- [x] Dedup-window cleaner (`AdmissionStore.CleanupExpired` + Runtime background sweep): terminal
+      command-admission records past the 24h `DedupWindow` are compare-and-swap deleted hourly, bounding
+      keyspace growth (§647). Uncertain/in-flight records are never cleaned.
 - [ ] 6.3 Schema expand/migrate/contract + leased capability records (§651). **(Later release.)**
 - [ ] 6.4 Runbooks: voter-count change, backup/defrag/compaction, one-member upgrades (§378). **(Docs.)**
 
@@ -235,8 +248,16 @@ decorates the events-controller `CommandRunner` with `EtcdCommandRouter`, calls
 Comment commands and autoplan flow through `runtime.Route` → owner admit/forward → fenced
 `RuntimeCoordinator.Execute`.
 
-**Still pending:** positive-PR `/api/plan` and `/api/apply` synchronous proxying (4.1); pull
-close/reopen and lock-UI owner routing (4.2/4.3); finer per-project-step barriers, lease-loss
-subprocess reaping, and plan takeover (3.1/3.3/3.5 — currently fenced at whole-command granularity);
-provider-delivery-ID admission dedup (each ingress is currently a distinct admission); the 24h
-admission dedup-window cleaner; and embedded identity-manifest activation + join-ticket flow (5.2/5.3).
+**Correctness fixes to the locking path (from the review).** The pull-cleaning marker is now attached
+to a bounded lease so an interrupted cleanup self-heals instead of wedging the pull's lock acquisition
+forever; the host-less legacy `GetLock`/`UnlockByPull` fail closed on cross-host ambiguity instead of
+guessing; and pull-close uses a host-exact, close-generation unlock (`UnlockByPullForClose`), making the
+`LifecycleClosed` state reachable and host-exact.
+
+**Still pending:** positive-PR `/api/plan` and `/api/apply` synchronous proxying (4.1); lock-UI owner
+routing (4.3); enforcement of the `LifecycleClosed` state in the acquire path plus the reopen transition
+(the close generation is now recorded but not yet enforced — enforcement is coupled to the reopen path
+and touches the core acquire hot path); finer per-project-step barriers, lease-loss subprocess reaping,
+and plan takeover (3.1/3.3/3.5 — currently fenced at whole-command granularity); provider-delivery-ID
+admission dedup (each ingress is currently a distinct admission); atomic single-use join-ticket
+consumption (5.6); and Helm packaging in the separate `runatlantis/helm-charts` repo (7.2).

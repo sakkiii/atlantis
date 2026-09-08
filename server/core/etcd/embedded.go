@@ -43,6 +43,12 @@ func NewEmbedded(ctx context.Context, cfg *Config) (Backend, error) {
 	if err := validateDataDirState(cfg.Embedded.Lifecycle, fileCfg.DataDir); err != nil {
 		return nil, err
 	}
+	// Validate the declared identity manifest, membership ticket, or restore
+	// manifest for the lifecycle before starting the server, cross-checking the
+	// data directory's persisted identity on restart (design §716 step 1, §785).
+	if err := validateLifecycleIdentity(cfg, fileCfg); err != nil {
+		return nil, err
+	}
 
 	embedCfg, err := buildEmbedConfig(fileCfg, cfg.Embedded.Lifecycle)
 	if err != nil {

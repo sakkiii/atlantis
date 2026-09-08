@@ -535,6 +535,30 @@ func (b *BoltDB) GetPullStatus(pull models.PullRequest) (*models.PullStatus, err
 	return s, nil
 }
 
+// ListPullStatuses lists all stored pull statuses. It is a read-only iteration
+// over the pulls bucket, intended for offline export/migration tooling.
+func (b *BoltDB) ListPullStatuses() ([]models.PullStatus, error) {
+	var statuses []models.PullStatus
+	err := b.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(b.pullsBucketName)
+		c := bucket.Cursor()
+		for k, _ := c.First(); k != nil; k, _ = c.Next() {
+			s, err := b.getPullFromBucket(bucket, k)
+			if err != nil {
+				return err
+			}
+			if s != nil {
+				statuses = append(statuses, *s)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("DB transaction failed: %w", err)
+	}
+	return statuses, nil
+}
+
 // DeletePullStatus deletes the status for pull.
 func (b *BoltDB) DeletePullStatus(pull models.PullRequest) error {
 	key, err := b.pullKey(pull)

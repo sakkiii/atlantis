@@ -49,8 +49,10 @@ func main() {
 	}
 	version := &cmd.VersionCmd{AtlantisVersion: atlantisVersion}
 	testdrive := &cmd.TestdriveCmd{}
+	migrateEtcd := &cmd.MigrateEtcdCmd{}
 	cmd.RootCmd.AddCommand(server.Init())
 	cmd.RootCmd.AddCommand(version.Init())
 	cmd.RootCmd.AddCommand(testdrive.Init())
+	cmd.RootCmd.AddCommand(migrateEtcd.Init())
 	cmd.Execute()
 }

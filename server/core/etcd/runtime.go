@@ -45,7 +45,17 @@ type Runtime struct {
 
 	router         *Router
 	internalServer *InternalServer
+
+	// cleanerCancel stops the background admission dedup-window cleaner; cleanerDone
+	// is closed when that goroutine has exited.
+	cleanerCancel context.CancelFunc
+	cleanerDone   chan struct{}
 }
+
+// admissionCleanupInterval is how often the dedup-window cleaner sweeps terminal
+// command-admission records. The retention window itself is DedupWindow (24h);
+// sweeping hourly keeps the keyspace bounded without frequent full scans.
+const admissionCleanupInterval = time.Hour
 
 // NewRuntime builds the backend and, for a serving process, the full
 // coordination stack. In embedded maintenance mode it returns a runtime that
@@ -120,7 +130,36 @@ func (rt *Runtime) buildAdapters(ctx context.Context) error {
 	if err := rt.loadInternalTransportSecurity(); err != nil {
 		return err
 	}
+
+	rt.startAdmissionCleaner()
 	return nil
+}
+
+// startAdmissionCleaner launches the background goroutine that periodically
+// compare-and-swap deletes terminal command-admission records older than the
+// dedup window. It is stopped by Close.
+func (rt *Runtime) startAdmissionCleaner() {
+	ctx, cancel := context.WithCancel(context.Background())
+	rt.cleanerCancel = cancel
+	rt.cleanerDone = make(chan struct{})
+	go func() {
+		defer close(rt.cleanerDone)
+		ticker := time.NewTicker(admissionCleanupInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				runCtx, runCancel := context.WithTimeout(ctx, 2*time.Minute)
+				// Best-effort: the package has no logger, and a failed sweep is
+				// retried on the next tick. Records are only ever deleted under an
+				// exact-revision guard, so a partial sweep is always safe.
+				_, _ = rt.admission.CleanupExpired(runCtx, time.Now())
+				runCancel()
+			}
+		}
+	}()
 }
 
 // loadInternalTransportSecurity reads the internal command token and internal CA.
@@ -214,6 +253,11 @@ func (rt *Runtime) Ready(ctx context.Context) error {
 // maintenance or partial-startup paths it closes the backend directly (design §751).
 func (rt *Runtime) Close() error {
 	var errs []error
+	// Stop the background cleaner before closing the shared client it uses.
+	if rt.cleanerCancel != nil {
+		rt.cleanerCancel()
+		<-rt.cleanerDone
+	}
 	if rt.ownership != nil {
 		if err := rt.ownership.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("closing ownership session: %w", err))
