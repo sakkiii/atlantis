@@ -736,6 +736,86 @@ ATLANTIS_ETCD_DEPLOYMENT_ID="<stable-uuid>"
 
 Stable unique identifier for this logical Atlantis installation, used to guard the etcd namespace. Generate it once and keep it stable across process restarts and database migrations.
 
+### `--etcd-embedded-config-file`
+
+```bash
+atlantis server --etcd-embedded-config-file="/etc/atlantis/etcd/embedded.json"
+# or
+ATLANTIS_ETCD_EMBEDDED_CONFIG_FILE="/etc/atlantis/etcd/embedded.json"
+```
+
+Path to the embedded etcd configuration file. Required when `--etcd-mode=embedded`.
+
+### `--etcd-embedded-identity-file`
+
+```bash
+atlantis server --etcd-embedded-identity-file="/etc/atlantis/etcd/identity.json"
+# or
+ATLANTIS_ETCD_EMBEDDED_IDENTITY_FILE="/etc/atlantis/etcd/identity.json"
+```
+
+Path to the embedded etcd identity manifest, retained outside the member PVC. Required in embedded mode.
+
+### `--etcd-embedded-join-endpoints`
+
+```bash
+atlantis server --etcd-embedded-join-endpoints="https://member-0:2379"
+# or
+ATLANTIS_ETCD_EMBEDDED_JOIN_ENDPOINTS="https://member-0:2379"
+```
+
+Comma-separated endpoints of the existing cluster, used only in `join-existing` lifecycle.
+
+### `--etcd-embedded-lifecycle`
+
+```bash
+atlantis server --etcd-embedded-lifecycle="restart"
+# or
+ATLANTIS_ETCD_EMBEDDED_LIFECYCLE="restart"
+```
+
+Mandatory embedded etcd lifecycle: `bootstrap`, `restart`, `join-existing`, or `restore`. Atlantis never derives it from directory emptiness.
+
+### `--etcd-embedded-membership-ticket-file`
+
+```bash
+atlantis server --etcd-embedded-membership-ticket-file="/etc/atlantis/etcd/ticket"
+# or
+ATLANTIS_ETCD_EMBEDDED_MEMBERSHIP_TICKET_FILE="/etc/atlantis/etcd/ticket"
+```
+
+Path to the one-time membership ticket file, used only in `join-existing` lifecycle.
+
+### `--etcd-embedded-restore-manifest-file`
+
+```bash
+atlantis server --etcd-embedded-restore-manifest-file="/etc/atlantis/etcd/restore.json"
+# or
+ATLANTIS_ETCD_EMBEDDED_RESTORE_MANIFEST_FILE="/etc/atlantis/etcd/restore.json"
+```
+
+Path to the pending recovery manifest, used only in `restore` lifecycle.
+
+### `--etcd-embedded-startup-purpose`
+
+```bash
+atlantis server --etcd-embedded-startup-purpose="serve"
+# or
+ATLANTIS_ETCD_EMBEDDED_STARTUP_PURPOSE="serve"
+```
+
+Embedded etcd startup purpose: `serve` (default) or `maintenance`. Maintenance forms and probes the cluster without serving Atlantis traffic.
+
+### `--etcd-embedded-voter-count`
+
+```bash
+atlantis server --etcd-embedded-voter-count=3
+# or
+ATLANTIS_ETCD_EMBEDDED_VOTER_COUNT=3
+```
+
+Desired final number of embedded etcd voting members. One of 3, 5, or 7. Defaults to 3.
+
 ### `--etcd-endpoints`
 
 ```bash
@@ -1230,6 +1310,26 @@ Include git untracked files in the Atlantis modified file list.
 Used for example with CDKTF pre-workflow hooks that dynamically generate
 Terraform files.
 
+### `--internal-command-ca-file`
+
+```bash
+atlantis server --internal-command-ca-file="/etc/atlantis/internal/ca.pem"
+# or
+ATLANTIS_INTERNAL_COMMAND_CA_FILE="/etc/atlantis/internal/ca.pem"
+```
+
+Path to the CA certificate that validates the internal command transport used for owner-routed forwarding in etcd mode.
+
+### `--internal-command-token-file`
+
+```bash
+atlantis server --internal-command-token-file="/etc/atlantis/internal/token"
+# or
+ATLANTIS_INTERNAL_COMMAND_TOKEN_FILE="/etc/atlantis/internal/token"
+```
+
+Path to a file containing the shared token authenticating the internal command transport. Required in production etcd mode.
+
 ### `--language` <Badge text="v0.45.0+" type="info"/>
 
 ```bash
@@ -1338,6 +1438,16 @@ ATLANTIS_MAX_COMMENTS_PER_COMMAND=100
 Limit the number of comments published after a command is executed, to prevent spamming your VCS and Atlantis to get throttled as a result. Defaults to `100`. Set this option to `0` to disable log truncation. Note that the truncation will happen on the top of the command output, to preserve the most important parts of the output, often displayed at the end.
 
 When command output exceeds the VCS comment size limit (or when this limit applies), Atlantis splits the output into multiple comments using **intelligent comment splitting**. Split points are chosen so that markdown structure is preserved: the splitter detects whether it is inside a code block (`` ``` ``), a `<details>` block, or inline code (`` ` ``), and inserts appropriate closing and continuation markers so that each comment renders correctly. Continuation comments are labeled with the command name (e.g. "Continued plan output from previous comment") when available.
+
+### `--ownership-ttl-seconds`
+
+```bash
+atlantis server --ownership-ttl-seconds=30
+# or
+ATLANTIS_OWNERSHIP_TTL_SECONDS=30
+```
+
+TTL in seconds of the etcd ownership session lease that backs active-active PR ownership. Defaults to 30, minimum 10.
 
 ### `--parallel-apply` <Badge text="v0.22.0+" type="info"/>
 
@@ -1493,6 +1603,36 @@ ATLANTIS_REDIS_USERNAME="myuser"
 ```
 
 The Redis Username for when using a Locking DB type of `redis`. Useful when Redis is configured with ACL-based authentication.
+
+### `--replica-advertise-allowlist`
+
+```bash
+atlantis server --replica-advertise-allowlist="10.0.0.0/8"
+# or
+ATLANTIS_REPLICA_ADVERTISE_ALLOWLIST="10.0.0.0/8"
+```
+
+Comma-separated host-or-CIDR allowlist of permitted internal forwarding destinations, preventing SSRF and token disclosure. Required in etcd mode.
+
+### `--replica-advertise-url`
+
+```bash
+atlantis server --replica-advertise-url="https://pod-0.atlantis-peer:4142"
+# or
+ATLANTIS_REPLICA_ADVERTISE_URL="https://pod-0.atlantis-peer:4142"
+```
+
+Internal https URL other replicas use to forward owner-routed commands to this replica. Required in etcd mode.
+
+### `--replica-id`
+
+```bash
+atlantis server --replica-id="atlantis-member-0"
+# or
+ATLANTIS_REPLICA_ID="atlantis-member-0"
+```
+
+Stable, unique replica identity for etcd active-active ownership. Defaults to the pod hostname; must resolve to a stable, unique value.
 
 ### `--repo-allowlist` <Badge text="v0.13.0" type="info"/>
 

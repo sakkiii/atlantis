@@ -189,8 +189,22 @@ The dispatch primitives (`Router`, transport) are built and tested (Phase 2). Re
       in the separate `runatlantis/helm-charts` repo; these are the reference for it to adopt.)
 - [ ] 7.2 Package into the actual Helm chart (separate repo) with TLS secret / identity-ticket wiring.
 
-## Config flags remaining
-Embedded (`--etcd-embedded-*`) and ownership (`--replica-*`, `--internal-command-*`,
-`--ownership-ttl-seconds`) flags are **not yet wired to `cmd/server.go`** — deferred until their
-consumers (embedded serve wiring, Phase 4 dispatch) land, to avoid validated-but-unused config. The
-etcd `Config` types + `Validate` already model them; only the CLI/`user_config`/docs surface is pending.
+## Config surface — complete
+All 27 etcd flags are wired to `cmd/server.go` + `user_config.go` + docs (external, embedded, and
+ownership/routing). `TestUserConfigAllTested` + `TestAllFlagsDocumented` (sorted) pass.
+
+## Runtime assembler — done + tested (`runtime.go`)
+`etcd.NewRuntime(ctx, cfg)` assembles the whole stack over one client: backend (external `NewExternal`
+or embedded `NewEmbedded`) → `InitOrValidateNamespace` (epoch) → database, ownership, admission,
+barrier, quarantine adapters. `AttachExecutor(executor)` late-binds the router + returns the internal
+command HTTP handler; `Route` dispatches ingress; `Ready` = backend authority + live ownership session;
+`Close` follows the fixed shutdown order. Maintenance embedded start returns a non-serving runtime.
+`server.go` `case "etcd"` now builds the Runtime and uses `runtime.Database()` (external + embedded
+serve). Tests: full-stack assembly + DB round-trip, two-runtime end-to-end forward-to-owner dispatch,
+migrated-namespace validation. (Transport auth hardened: tolerant Bearer parse for the empty dev token.)
+
+**Still pending (the command-pipeline integration seam):** call `runtime.AttachExecutor` with an
+executor wrapping Atlantis's async scheduler and mount its handler on the internal listener; drive
+`/readyz` from `runtime.Ready`; call `runtime.Close` on shutdown; thread `runtime.Route` into the
+`command_runner.go` / API / lock-UI entry points (Phase 4 route-inventory gate) with the per-boundary
+barrier fencing (3.1/3.3/3.5). Embedded identity-manifest activation + join-ticket flow (5.2/5.3).

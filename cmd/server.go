@@ -128,6 +128,20 @@ const (
 	EtcdRequestTimeoutFlag           = "etcd-request-timeout"
 	EtcdStartupTimeoutFlag           = "etcd-startup-timeout"
 	EtcdAllowInsecureDevFlag         = "etcd-allow-insecure-dev"
+	EtcdEmbeddedConfigFileFlag       = "etcd-embedded-config-file"
+	EtcdEmbeddedVoterCountFlag       = "etcd-embedded-voter-count"
+	EtcdEmbeddedLifecycleFlag        = "etcd-embedded-lifecycle"
+	EtcdEmbeddedStartupPurposeFlag   = "etcd-embedded-startup-purpose"
+	EtcdEmbeddedIdentityFileFlag     = "etcd-embedded-identity-file"
+	EtcdEmbeddedJoinEndpointsFlag    = "etcd-embedded-join-endpoints"
+	EtcdEmbeddedMembershipTicketFile = "etcd-embedded-membership-ticket-file" // nolint: gosec
+	EtcdEmbeddedRestoreManifestFile  = "etcd-embedded-restore-manifest-file"
+	ReplicaIDFlag                    = "replica-id"
+	ReplicaAdvertiseURLFlag          = "replica-advertise-url"
+	ReplicaAdvertiseAllowlistFlag    = "replica-advertise-allowlist"
+	InternalCommandTokenFileFlag     = "internal-command-token-file" // nolint: gosec
+	InternalCommandCAFileFlag        = "internal-command-ca-file"
+	OwnershipTTLSecondsFlag          = "ownership-ttl-seconds"
 	LogLevelFlag                     = "log-level"
 	MarkdownTemplateOverridesDirFlag = "markdown-template-overrides-dir"
 	MaxCommentsPerCommand            = "max-comments-per-command"
@@ -203,6 +217,9 @@ const (
 	DefaultEtcdNamespace                = "/atlantis"
 	DefaultEtcdRequestTimeout           = "5s"
 	DefaultEtcdStartupTimeout           = "5m"
+	DefaultEtcdEmbeddedVoterCount       = 3
+	DefaultEtcdEmbeddedStartupPurpose   = "serve"
+	DefaultOwnershipTTLSeconds          = 30
 	DefaultLanguage                     = i18n.DefaultLanguage
 	DefaultLogLevel                     = "info"
 	DefaultIgnoreVCSStatusNames         = ""
@@ -480,6 +497,43 @@ var stringFlags = map[string]stringFlag{
 	EtcdStartupTimeoutFlag: {
 		description:  "Timeout bounding initial etcd connectivity and embedded quorum formation, ex. 5m.",
 		defaultValue: DefaultEtcdStartupTimeout,
+	},
+	EtcdEmbeddedConfigFileFlag: {
+		description: "Path to the embedded etcd configuration file (embedded mode).",
+	},
+	EtcdEmbeddedLifecycleFlag: {
+		description: "Embedded etcd lifecycle: bootstrap, restart, join-existing, or restore.",
+	},
+	EtcdEmbeddedStartupPurposeFlag: {
+		description:  "Embedded etcd startup purpose: serve or maintenance.",
+		defaultValue: DefaultEtcdEmbeddedStartupPurpose,
+	},
+	EtcdEmbeddedIdentityFileFlag: {
+		description: "Path to the embedded etcd identity manifest (embedded mode).",
+	},
+	EtcdEmbeddedJoinEndpointsFlag: {
+		description: "Comma-separated existing-cluster endpoints used only in join-existing mode.",
+	},
+	EtcdEmbeddedMembershipTicketFile: {
+		description: "Path to the one-time membership ticket file used only in join-existing mode.",
+	},
+	EtcdEmbeddedRestoreManifestFile: {
+		description: "Path to the pending recovery manifest used only in restore mode.",
+	},
+	ReplicaIDFlag: {
+		description: "Stable, unique replica identity for etcd active-active ownership. Defaults to the pod hostname.",
+	},
+	ReplicaAdvertiseURLFlag: {
+		description: "Internal https URL other replicas use to forward owner-routed commands to this replica.",
+	},
+	ReplicaAdvertiseAllowlistFlag: {
+		description: "Comma-separated host-or-CIDR allowlist of permitted internal forwarding destinations (SSRF guard).",
+	},
+	InternalCommandTokenFileFlag: {
+		description: "Path to a file containing the shared internal command transport token.",
+	},
+	InternalCommandCAFileFlag: {
+		description: "Path to the CA certificate that validates the internal command transport.",
 	},
 	LogLevelFlag: {
 		description:  "Log level. Either debug, info, warn, or error.",
@@ -771,6 +825,14 @@ var boolFlags = map[string]boolFlag{
 	},
 }
 var intFlags = map[string]intFlag{
+	EtcdEmbeddedVoterCountFlag: {
+		description:  "Desired final number of embedded etcd voting members. One of 3, 5, or 7.",
+		defaultValue: DefaultEtcdEmbeddedVoterCount,
+	},
+	OwnershipTTLSecondsFlag: {
+		description:  "TTL in seconds of the etcd ownership session lease. Minimum 10.",
+		defaultValue: DefaultOwnershipTTLSeconds,
+	},
 	CheckoutDepthFlag: {
 		description: fmt.Sprintf("Used only if --%s=%s.", CheckoutStrategyFlag, CheckoutStrategyMerge) +
 			" How many commits to include in each of base and feature branches when cloning repository." +
@@ -1090,6 +1152,15 @@ func (s *ServerCmd) setDefaults(c *server.UserConfig, v *viper.Viper) {
 	}
 	if c.EtcdStartupTimeout == "" {
 		c.EtcdStartupTimeout = DefaultEtcdStartupTimeout
+	}
+	if c.EtcdEmbeddedVoterCount == 0 {
+		c.EtcdEmbeddedVoterCount = DefaultEtcdEmbeddedVoterCount
+	}
+	if c.EtcdEmbeddedStartupPurpose == "" {
+		c.EtcdEmbeddedStartupPurpose = DefaultEtcdEmbeddedStartupPurpose
+	}
+	if c.OwnershipTTLSeconds == 0 {
+		c.OwnershipTTLSeconds = DefaultOwnershipTTLSeconds
 	}
 	if c.Language == "" {
 		c.Language = DefaultLanguage

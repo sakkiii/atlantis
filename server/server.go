@@ -534,34 +534,53 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		}
 	case "etcd":
 		etcdCfg, buildErr := etcd.BuildConfig(etcd.Settings{
-			Mode:             userConfig.EtcdMode,
-			DeploymentID:     userConfig.EtcdDeploymentID,
-			Namespace:        userConfig.EtcdNamespace,
-			Endpoints:        userConfig.EtcdEndpoints,
-			CAFile:           userConfig.EtcdCAFile,
-			CertFile:         userConfig.EtcdCertFile,
-			KeyFile:          userConfig.EtcdKeyFile,
-			ServerName:       userConfig.EtcdServerName,
-			Username:         userConfig.EtcdUsername,
-			PasswordFile:     userConfig.EtcdPasswordFile,
-			RequestTimeout:   userConfig.EtcdRequestTimeout,
-			StartupTimeout:   userConfig.EtcdStartupTimeout,
-			AllowInsecureDev: userConfig.EtcdAllowInsecureDev,
+			Mode:                      userConfig.EtcdMode,
+			DeploymentID:              userConfig.EtcdDeploymentID,
+			Namespace:                 userConfig.EtcdNamespace,
+			Endpoints:                 userConfig.EtcdEndpoints,
+			CAFile:                    userConfig.EtcdCAFile,
+			CertFile:                  userConfig.EtcdCertFile,
+			KeyFile:                   userConfig.EtcdKeyFile,
+			ServerName:                userConfig.EtcdServerName,
+			Username:                  userConfig.EtcdUsername,
+			PasswordFile:              userConfig.EtcdPasswordFile,
+			RequestTimeout:            userConfig.EtcdRequestTimeout,
+			StartupTimeout:            userConfig.EtcdStartupTimeout,
+			AllowInsecureDev:          userConfig.EtcdAllowInsecureDev,
+			EmbeddedConfigFile:        userConfig.EtcdEmbeddedConfigFile,
+			EmbeddedVoterCount:        userConfig.EtcdEmbeddedVoterCount,
+			EmbeddedLifecycle:         userConfig.EtcdEmbeddedLifecycle,
+			EmbeddedStartupPurpose:    userConfig.EtcdEmbeddedStartupPurpose,
+			EmbeddedIdentityFile:      userConfig.EtcdEmbeddedIdentityFile,
+			EmbeddedJoinEndpoints:     userConfig.EtcdEmbeddedJoinEndpoints,
+			EmbeddedMembershipTicket:  userConfig.EtcdEmbeddedMembershipTicket,
+			EmbeddedRestoreManifest:   userConfig.EtcdEmbeddedRestoreManifest,
+			ReplicaID:                 userConfig.ReplicaID,
+			ReplicaAdvertiseURL:       userConfig.ReplicaAdvertiseURL,
+			ReplicaAdvertiseAllowlist: userConfig.ReplicaAdvertiseAllowlist,
+			InternalCommandTokenFile:  userConfig.InternalCommandTokenFile,
+			InternalCommandCAFile:     userConfig.InternalCommandCAFile,
+			OwnershipTTLSeconds:       userConfig.OwnershipTTLSeconds,
 		})
 		if buildErr != nil {
 			return nil, buildErr
 		}
-		if etcdCfg.Mode == etcd.ModeEmbedded {
-			// Embedded runtime and active-active ownership/routing are not yet
-			// implemented; only external single-replica database mode is wired.
-			return nil, errors.New("etcd embedded mode is not yet implemented; use --etcd-mode=external")
+		if etcdCfg.Mode == etcd.ModeEmbedded && userConfig.EtcdEmbeddedStartupPurpose == "maintenance" {
+			// Maintenance is an operator-tooling bring-up (bootstrap/restore) that
+			// does not serve Atlantis traffic; the main server serve path requires
+			// a serving runtime.
+			return nil, errors.New("etcd-embedded-startup-purpose=maintenance does not serve Atlantis; use operator tooling")
 		}
-		logger.Info("Utilizing external etcd at %s", strings.Join(etcdCfg.Endpoints, ", "))
-		backend, backendErr := etcd.NewExternal(context.Background(), etcdCfg)
-		if backendErr != nil {
-			return nil, backendErr
+		logger.Info("Utilizing etcd (%s mode) for locking and coordination", etcdCfg.Mode)
+		etcdRuntime, rtErr := etcd.NewRuntime(context.Background(), etcdCfg)
+		if rtErr != nil {
+			return nil, rtErr
 		}
-		database = etcd.NewDatabase(backend, etcdCfg.Namespace, etcdCfg.RequestTimeout)
+		// NOTE: active-active owner routing (etcdRuntime.AttachExecutor/Route),
+		// readiness from etcdRuntime.Ready, and ownership-session shutdown are
+		// wired as the command-pipeline integration lands. The database adapter is
+		// authoritative today.
+		database = etcdRuntime.Database()
 	default:
 		return nil, fmt.Errorf("unsupported locking-db-type %q; supported values are boltdb, redis, etcd", dbtype)
 	}

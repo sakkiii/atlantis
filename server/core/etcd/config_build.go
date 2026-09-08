@@ -31,6 +31,24 @@ type Settings struct {
 	StartupTimeout   string // duration, e.g. "5m"
 	AllowInsecureDev bool
 	Endpoints        string // comma-separated
+
+	// Embedded mode.
+	EmbeddedConfigFile       string
+	EmbeddedVoterCount       int
+	EmbeddedLifecycle        string
+	EmbeddedStartupPurpose   string
+	EmbeddedIdentityFile     string
+	EmbeddedJoinEndpoints    string // comma-separated
+	EmbeddedMembershipTicket string
+	EmbeddedRestoreManifest  string
+
+	// Ownership and routing.
+	ReplicaID                 string
+	ReplicaAdvertiseURL       string
+	ReplicaAdvertiseAllowlist string // comma-separated
+	InternalCommandTokenFile  string
+	InternalCommandCAFile     string
+	OwnershipTTLSeconds       int
 }
 
 // BuildConfig parses and defaults Settings into a Config. It does not validate;
@@ -50,6 +68,11 @@ func BuildConfig(s Settings) (*Config, error) {
 		return nil, fmt.Errorf("etcd-startup-timeout: %w", err)
 	}
 
+	ttl := DefaultOwnershipTTL
+	if s.OwnershipTTLSeconds > 0 {
+		ttl = time.Duration(s.OwnershipTTLSeconds) * time.Second
+	}
+
 	return &Config{
 		Mode:             Mode(s.Mode),
 		DeploymentID:     s.DeploymentID,
@@ -61,6 +84,24 @@ func BuildConfig(s Settings) (*Config, error) {
 		StartupTimeout:   startTimeout,
 		AllowInsecureDev: s.AllowInsecureDev,
 		Endpoints:        splitCSV(s.Endpoints),
+		Embedded: EmbeddedConfig{
+			ConfigFile:           s.EmbeddedConfigFile,
+			VoterCount:           s.EmbeddedVoterCount,
+			Lifecycle:            Lifecycle(s.EmbeddedLifecycle),
+			StartupPurpose:       StartupPurpose(s.EmbeddedStartupPurpose),
+			IdentityFile:         s.EmbeddedIdentityFile,
+			JoinEndpoints:        splitCSV(s.EmbeddedJoinEndpoints),
+			MembershipTicketFile: s.EmbeddedMembershipTicket,
+			RestoreManifestFile:  s.EmbeddedRestoreManifest,
+		},
+		Ownership: OwnershipConfig{
+			ReplicaID:                 s.ReplicaID,
+			ReplicaAdvertiseURL:       s.ReplicaAdvertiseURL,
+			ReplicaAdvertiseAllowlist: splitCSV(s.ReplicaAdvertiseAllowlist),
+			InternalCommandTokenFile:  s.InternalCommandTokenFile,
+			InternalCommandCAFile:     s.InternalCommandCAFile,
+			TTL:                       ttl,
+		},
 	}, nil
 }
 

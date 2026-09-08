@@ -199,14 +199,17 @@ func (s *InternalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	writeResult(w, result)
 }
 
-// authenticate compares the bearer token in constant time (design §811).
+// authenticate compares the bearer token in constant time (design §811). The
+// header is trimmed and the "Bearer" scheme matched case-insensitively with an
+// optional space, so an empty token (development only) is not mangled by HTTP
+// header whitespace trimming.
 func (s *InternalServer) authenticate(r *http.Request) bool {
-	const prefix = "Bearer "
-	h := r.Header.Get("Authorization")
-	if !strings.HasPrefix(h, prefix) {
+	h := strings.TrimSpace(r.Header.Get("Authorization"))
+	const scheme = "bearer"
+	if len(h) < len(scheme) || !strings.EqualFold(h[:len(scheme)], scheme) {
 		return false
 	}
-	got := strings.TrimPrefix(h, prefix)
+	got := strings.TrimSpace(h[len(scheme):])
 	return subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1
 }
 
