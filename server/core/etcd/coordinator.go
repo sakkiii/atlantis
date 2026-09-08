@@ -52,6 +52,12 @@ const (
 	// ExecuteUnavailable means a coordination backend error prevented fencing; the
 	// command was not run and the caller must fail closed.
 	ExecuteUnavailable
+	// ExecuteUncertain means the run function executed but the ownership lease was
+	// lost during it, so the outcome cannot be positively fenced. The execution
+	// barrier is left in place (blocking a new owner generation) and the command is
+	// marked uncertain, requiring explicit resolution and never auto-replayed
+	// (design §558, §776).
+	ExecuteUncertain
 )
 
 // RuntimeCoordinator adapts a *Runtime to the narrow ingress/owner-side contract
@@ -73,6 +79,21 @@ func NewRuntimeCoordinator(rt *Runtime) *RuntimeCoordinator {
 // Result whose Status the caller maps to proceed/fail-closed.
 func (c *RuntimeCoordinator) Route(ctx context.Context, cmd Command) (Result, error) {
 	return c.rt.Route(ctx, cmd)
+}
+
+// ReopenPull clears a closed pull's lifecycle so a reopened pull request accepts
+// new project locks again (design §450). It is called on autoplan ingress — the
+// reopen signal, since Atlantis handles a reopened PR as an open event — and is a
+// cheap no-op when the pull is not closed.
+func (c *RuntimeCoordinator) ReopenPull(ctx context.Context, vcsHostname, repoFullName string, pullNum int) error {
+	if c.rt.database == nil {
+		return nil
+	}
+	return c.rt.database.Scoped().ReopenProjectPull(ctx, PullScope{
+		VCSHostname: vcsHostname,
+		Repository:  repoFullName,
+		PullNum:     pullNum,
+	})
 }
 
 // ResolveOwner resolves (claiming if unowned) the owner of a pull for
@@ -171,6 +192,18 @@ func (c *RuntimeCoordinator) Execute(cmd Command, run func() bool) ExecuteOutcom
 
 	success := run()
 
+	// If the ownership lease was lost at any point up to here, this process is no
+	// longer the authoritative owner and cannot positively acknowledge completion.
+	// Leave the barrier in place as a cross-generation fence and mark the command
+	// uncertain rather than clearing the fence (design §558, §776).
+	if c.leaseLost() {
+		uctx, ucancel := context.WithTimeout(context.Background(), c.rt.RequestTimeout())
+		_ = c.rt.Barriers().MarkUncertain(uctx, barrier)
+		ucancel()
+		c.markUncertain(cmd.Identity)
+		return ExecuteUncertain
+	}
+
 	cctx, ccancel := context.WithTimeout(context.Background(), c.rt.RequestTimeout())
 	// Clearing the barrier is the authenticated completion acknowledgement: this
 	// process ran the step to completion, so the cross-generation fence is
@@ -181,6 +214,17 @@ func (c *RuntimeCoordinator) Execute(cmd Command, run func() bool) ExecuteOutcom
 
 	c.complete(cmd.Identity, success)
 	return ExecuteRan
+}
+
+// leaseLost reports whether this process's ownership session lease has been lost,
+// which makes it non-authoritative for completing fenced work.
+func (c *RuntimeCoordinator) leaseLost() bool {
+	select {
+	case <-c.rt.ownership.Done():
+		return true
+	default:
+		return false
+	}
 }
 
 // advanceRunning best-effort moves the admission record scheduled -> running. The

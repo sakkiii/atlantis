@@ -42,6 +42,10 @@ const (
 	// routeBlockedComment is surfaced when an unresolved execution from an earlier
 	// owner generation still fences this pull request (design §558).
 	routeBlockedComment = "Atlantis has an unresolved in-flight execution for this pull request from a previous server generation. No action was taken; this pull request is held until the earlier execution is resolved by an operator."
+
+	// routeUncertainComment is surfaced when a command ran but the owning replica
+	// lost its lease during execution, so the outcome cannot be confirmed.
+	routeUncertainComment = "Atlantis started this command but lost ownership of the pull request during execution across its high-availability replicas, so the outcome is **uncertain**. Do not assume it completed or was skipped; verify the actual state (e.g. Terraform state / provider) before retrying. This pull request is held until an operator resolves it."
 )
 
 // EtcdCoordinator is the subset of the etcd runtime the router depends on. It
@@ -54,6 +58,9 @@ type EtcdCoordinator interface {
 	// Execute fences and runs an admitted command on the owning replica, invoking
 	// run to perform the actual work (owner side).
 	Execute(cmd etcd.Command, run func() bool) etcd.ExecuteOutcome
+	// ReopenPull clears a closed pull's lifecycle so a reopened pull request
+	// accepts new locks again. It is a no-op when the pull is not closed.
+	ReopenPull(ctx context.Context, vcsHostname, repoFullName string, pullNum int) error
 }
 
 // routedPayload is the serialized command body forwarded between replicas. It
@@ -91,6 +98,15 @@ func NewEtcdCommandRouter(delegate CommandRunner, coordinator EtcdCoordinator, v
 // RunAutoplanCommand dispatches an autoplan through owner routing. The wrapped
 // runner executes it on whichever replica owns the pull request.
 func (r *EtcdCommandRouter) RunAutoplanCommand(baseRepo models.Repo, headRepo models.Repo, pull models.PullRequest, user models.User) {
+	// An autoplan follows an opened/updated/reopened pull event, so it is the
+	// signal that a previously-closed pull is live again: clear any closed
+	// lifecycle before routing so the pull accepts new locks (design §450).
+	reopenCtx, cancel := context.WithTimeout(context.Background(), routeIngressTimeout)
+	if err := r.coordinator.ReopenPull(reopenCtx, baseRepo.VCSHost.Hostname, baseRepo.FullName, pull.Num); err != nil {
+		r.logger.Warn("etcd routing: reopening pull %s#%d lifecycle: %s", baseRepo.FullName, pull.Num, err)
+	}
+	cancel()
+
 	hr := headRepo
 	p := pull
 	payload := routedPayload{
@@ -184,6 +200,11 @@ func (r *EtcdCommandRouter) execute(cmd etcd.Command, payload routedPayload) {
 	case etcd.ExecuteBlocked:
 		r.logger.Warn("etcd routing: pull %s#%d blocked by an older-generation execution barrier", payload.BaseRepo.FullName, payload.PullNum)
 		r.failClosed(payload.BaseRepo, payload.PullNum, routeBlockedComment)
+	case etcd.ExecuteUncertain:
+		// The command ran but ownership was lost mid-execution, so its outcome
+		// cannot be confirmed. Do not claim "no action taken".
+		r.logger.Warn("etcd routing: pull %s#%d execution outcome is uncertain (ownership lost during execution)", payload.BaseRepo.FullName, payload.PullNum)
+		r.failClosed(payload.BaseRepo, payload.PullNum, routeUncertainComment)
 	default:
 		r.logger.Warn("etcd routing: fenced execution for pull %s#%d did not start (outcome %d)", payload.BaseRepo.FullName, payload.PullNum, outcome)
 		r.failClosed(payload.BaseRepo, payload.PullNum, routeUnavailableComment)

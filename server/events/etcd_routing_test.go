@@ -35,6 +35,7 @@ type fakeCoordinator struct {
 	execRun     bool // whether Execute should invoke run
 	executed    *etcd.Command
 	ran         bool
+	reopened    int
 	done        chan struct{}
 }
 
@@ -68,6 +69,13 @@ func (f *fakeCoordinator) Execute(cmd etcd.Command, run func() bool) etcd.Execut
 	default:
 	}
 	return f.execOutcome
+}
+
+func (f *fakeCoordinator) ReopenPull(_ context.Context, _, _ string, _ int) error {
+	f.mu.Lock()
+	f.reopened++
+	f.mu.Unlock()
+	return nil
 }
 
 func (f *fakeCoordinator) waitExecuted(t *testing.T) {

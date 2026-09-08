@@ -12,6 +12,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/runatlantis/atlantis/server/core/etcd"
 	"github.com/runatlantis/atlantis/server/events/models"
 	. "github.com/runatlantis/atlantis/testing"
 )
@@ -85,6 +86,41 @@ func TestUnlockByPullForClose_HostExact(t *testing.T) {
 	Ok(t, err)
 	Equals(t, 1, len(locks))
 	Equals(t, "gitlab.com", locks[0].Pull.BaseRepo.VCSHost.Hostname)
+}
+
+// TestLifecycle_ClosedBlocksAcquireUntilReopen proves that a closed pull refuses
+// new project locks, and that reopening it restores acquisition.
+func TestLifecycle_ClosedBlocksAcquireUntilReopen(t *testing.T) {
+	d := newDB(t)
+	ctx := context.Background()
+	lock := projectLock("github.com", "o/r", ".", "default", 1)
+	scope := etcd.ProjectScope{VCSHostname: "github.com", Repository: "o/r", Path: ".", Workspace: "default"}
+	pull := etcd.PullScope{VCSHostname: "github.com", Repository: "o/r", PullNum: 1}
+
+	ok, _, err := d.TryLock(lock)
+	Ok(t, err)
+	Assert(t, ok, "initial lock should acquire")
+
+	// Close the pull (host-exact, close-generation unlock).
+	_, err = d.UnlockByPullForClose("o/r", "github.com", 1)
+	Ok(t, err)
+
+	// A new acquire on the closed pull must fail closed.
+	ok, _, err = d.TryLock(lock)
+	Assert(t, !ok, "acquire on a closed pull must not succeed")
+	Assert(t, err != nil, "acquire on a closed pull must fail closed")
+
+	// Reopen the pull, then acquisition works again.
+	Ok(t, d.Scoped().ReopenProjectPull(ctx, pull))
+	ok, _, err = d.TryLock(lock)
+	Ok(t, err)
+	Assert(t, ok, "acquire after reopen should succeed")
+
+	// ReopenProjectPull is a no-op on an already-open pull.
+	Ok(t, d.Scoped().ReopenProjectPull(ctx, pull))
+	got, err := d.Scoped().GetProjectLock(ctx, scope)
+	Ok(t, err)
+	Assert(t, got != nil, "lock should still be present after a no-op reopen")
 }
 
 // TestUnlockByPullScope_ClearsCleaningMarker proves that after cleanup the pull

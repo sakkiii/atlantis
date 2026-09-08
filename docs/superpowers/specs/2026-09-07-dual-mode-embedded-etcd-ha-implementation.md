@@ -169,8 +169,10 @@ integration seam is now wired for the asynchronous comment/autoplan path:
       replica is not the owner — proxy the request to the owner's advertise URL (allowlisted, internal
       TLS, API secret forwarded, loop-guard header) and return its response. Non-PR/synthetic requests
       and already-proxied requests run locally. Tests: `coordinator_api_test.go`.
-- [x] 4.2 Pull-close cleanup uses the host-exact, close-generation unlock (`UnlockByPullForClose`); the
-      reopen lifecycle transition remains a follow-up (see the lifecycle note below).
+- [x] 4.2 Pull-close cleanup uses the host-exact, close-generation unlock (`UnlockByPullForClose`), and
+      the close is now *enforced*: `AcquireProjectLock` refuses a closed pull (TOCTOU-safe, pinned to the
+      lifecycle record's revision), and autoplan ingress calls `ReopenPull` so a reopened PR accepts
+      locks again (`ReopenProjectPull`, generation-bumped). Tested close→blocked→reopen→allowed.
 - [ ] 4.3 Lock-UI routing (`locks_controller.go`) when deletion affects owner-local plan state — low
       value (the delete is a safe cluster-wide CAS; only best-effort local plan cleanup is owner-local)
       and the UI lock id lacks the pull number needed to resolve ownership. **Deferred.**
@@ -182,9 +184,18 @@ integration seam is now wired for the asynchronous comment/autoplan path:
 Execution barriers are established at whole-command granularity in `RuntimeCoordinator.Execute`, not at
 each §534 project-workflow boundary inside `project_command_runner.go`. This is sufficient for the
 cross-generation takeover invariant (a new owner generation is blocked while an older generation's
-command barrier is unresolved), and parallel same-generation commands proceed. Finer per-project-step
-barriers, lease-loss subprocess reaping, and plan takeover (3.1/3.3/3.5) require threading the claim
-generation into the project contexts and a cancellable exec path, and remain follow-ups.
+command barrier is unresolved), and parallel same-generation commands proceed.
+
+- [x] 3.3 (lease-loss fencing): if the ownership lease is lost while a command runs, `Execute` leaves the
+      barrier in place and marks the command **uncertain** (`ExecuteUncertain` → a user-visible
+      "outcome uncertain" comment) instead of clearing the fence, so a new owner generation stays blocked
+      until an operator resolves it (design §558, §776). Readiness already reports unready on lease loss.
+      Tested: lease dropped mid-run → uncertain admission + a new owner blocked by the retained barrier.
+- [ ] 3.1 finer per-project-step barriers and 3.5 plan takeover (clone + external-plan-store restore with
+      head-commit validation), plus in-flight **subprocess reaping** on lease loss, require threading the
+      claim generation into the project contexts and a cancellable exec path through the runner and
+      multi-process test infra. Remain follow-ups. (The whole-command barrier + uncertain-marking above
+      already fence a lost-lease run; reaping only shortens the window before the subprocess exits.)
 
 ## Phase 5 — Embedded runtime (WS2)
 
@@ -254,12 +265,16 @@ Comment commands and autoplan flow through `runtime.Route` → owner admit/forwa
 **Correctness fixes to the locking path (from the review).** The pull-cleaning marker is now attached
 to a bounded lease so an interrupted cleanup self-heals instead of wedging the pull's lock acquisition
 forever; the host-less legacy `GetLock`/`UnlockByPull` fail closed on cross-host ambiguity instead of
-guessing; and pull-close uses a host-exact, close-generation unlock (`UnlockByPullForClose`), making the
-`LifecycleClosed` state reachable and host-exact.
+guessing; and pull-close uses a host-exact, close-generation unlock (`UnlockByPullForClose`). The
+`LifecycleClosed` state is now enforced in `AcquireProjectLock` (TOCTOU-safe) and cleared by the
+generation-bumped `ReopenProjectPull` on reopen, so a delayed command cannot lock a project on a closed
+pull until it is reopened.
 
-**Still pending:** lock-UI owner routing (4.3); enforcement of the `LifecycleClosed` state in the acquire path plus the reopen transition
-(the close generation is now recorded but not yet enforced — enforcement is coupled to the reopen path
-and touches the core acquire hot path); finer per-project-step barriers, lease-loss subprocess reaping,
-and plan takeover (3.1/3.3/3.5 — currently fenced at whole-command granularity); provider-delivery-ID
-admission dedup (each ingress is currently a distinct admission); atomic single-use join-ticket
-consumption (5.6); and Helm packaging in the separate `runatlantis/helm-charts` repo (7.2).
+**Still pending:** lock-UI owner routing (4.3 — deferred as a minor, self-healing residual: only a stale
+owner-local plan file, since the lock delete and external-plan-store delete already work cluster-wide);
+finer per-project-step barriers, in-flight subprocess reaping on lease loss, and plan takeover
+(3.1/3.5 — currently fenced at whole-command granularity, and a lost-lease run is already marked
+uncertain); provider-delivery-ID admission dedup (each ingress is currently a distinct admission — needs
+threading the delivery ID through the `CommandRunner` interface); atomic single-use join-ticket
+consumption (5.6 — needs live-cluster ops); and Helm packaging in the separate `runatlantis/helm-charts`
+repo (7.2).

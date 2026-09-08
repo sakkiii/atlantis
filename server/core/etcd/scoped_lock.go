@@ -67,6 +67,7 @@ type ScopedProjectLockStore interface {
 	UnlockIfOwnedByPull(ctx context.Context, scope ProjectScope, pullNum int) (*models.ProjectLock, error)
 	ListProjectLocks(ctx context.Context) ([]models.ProjectLock, error)
 	UnlockByPullScope(ctx context.Context, scope PullScope, closeGen bool) ([]models.ProjectLock, error)
+	ReopenProjectPull(ctx context.Context, scope PullScope) error
 	UILockID(scope ProjectScope) string
 	DecodeUILockID(id string) (ProjectScope, error)
 }
@@ -78,54 +79,135 @@ type scopedLockStore struct {
 	keys  Keyspace
 }
 
+// acquireLifecycleRetries bounds how many times AcquireProjectLock re-reads the
+// pull lifecycle when a concurrent close/reopen invalidates its acquire
+// transaction. A handful is ample: each retry follows a committed lifecycle
+// transition, which is rare relative to lock acquisition.
+const acquireLifecycleRetries = 4
+
 // AcquireProjectLock acquires a project lock with a create-only transaction
-// (design §434: CreateRevision(key) == 0). It additionally refuses acquisition
-// while the pull's lifecycle record is in the cleaning state (design §442).
+// (design §434: CreateRevision(key) == 0). It refuses acquisition while the
+// pull's lifecycle record is in the cleaning state, and refuses it outright when
+// the pull's lifecycle is closed, so a delayed command cannot lock a project on a
+// closed pull until the pull is reopened (design §442, §450). The acquire
+// transaction is pinned to the lifecycle record's revision so a close committing
+// concurrently invalidates the acquire rather than racing it (TOCTOU-safe).
 func (s *scopedLockStore) AcquireProjectLock(ctx context.Context, scope ProjectScope, lock models.ProjectLock) (bool, models.ProjectLock, error) {
 	key := s.keys.ProjectLockKey(scope)
-	cleaningKey := s.keys.PullCleaningKey(PullScope{VCSHostname: scope.VCSHostname, Repository: scope.Repository, PullNum: lock.Pull.Num})
+	pull := PullScope{VCSHostname: scope.VCSHostname, Repository: scope.Repository, PullNum: lock.Pull.Num}
+	cleaningKey := s.keys.PullCleaningKey(pull)
+	lifecycleKey := s.keys.PullLifecycleKey(pull)
 
 	val, err := encodeValue(lockRecordKind, lockRecordV1, lock)
 	if err != nil {
 		return false, models.ProjectLock{}, err
 	}
 
-	// The transaction commits only when the lock key does not yet exist AND no
-	// cleaning is in progress for this pull. Both are expressed as
-	// CreateRevision==0 (key absence), which is reliable in an etcd transaction;
-	// a Value comparison on a possibly-absent key is not. Asserting the cleaning
-	// key inside the same transaction closes the race against UnlockByPullScope.
-	resp, err := s.kv.Txn(ctx).
-		If(
-			clientv3.Compare(clientv3.CreateRevision(key), "=", 0),
-			clientv3.Compare(clientv3.CreateRevision(cleaningKey), "=", 0),
-		).
-		Then(clientv3.OpPut(key, string(val))).
-		Else(clientv3.OpGet(key)).
-		Commit()
-	if err != nil {
-		return false, models.ProjectLock{}, fmt.Errorf("acquiring project lock: %w", err)
-	}
-	if resp.Succeeded {
-		return true, lock, nil
-	}
+	for attempt := 0; attempt < acquireLifecycleRetries; attempt++ {
+		_, state, lrev, err := s.readLifecycle(ctx, lifecycleKey)
+		if err != nil {
+			return false, models.ProjectLock{}, err
+		}
+		if state == LifecycleClosed {
+			return false, models.ProjectLock{}, errPullClosed
+		}
 
-	// Not acquired: report why. If a lock exists, return the current holder;
-	// otherwise the pull is mid-cleanup and acquisition is refused.
-	getLock := resp.Responses[0].GetResponseRange()
-	if len(getLock.Kvs) == 0 {
-		return false, models.ProjectLock{}, errPullCleaning
+		// The transaction commits only when the lock key does not yet exist, no
+		// cleaning is in progress, AND the lifecycle record is unchanged since it
+		// was read. Absence is expressed as CreateRevision==0 (reliable in a txn,
+		// unlike a Value comparison on a possibly-absent key); the lifecycle
+		// ModRevision guard closes the race against a concurrent close/reopen.
+		resp, err := s.kv.Txn(ctx).
+			If(
+				clientv3.Compare(clientv3.CreateRevision(key), "=", 0),
+				clientv3.Compare(clientv3.CreateRevision(cleaningKey), "=", 0),
+				clientv3.Compare(clientv3.ModRevision(lifecycleKey), "=", lrev),
+			).
+			Then(clientv3.OpPut(key, string(val))).
+			Else(clientv3.OpGet(key), clientv3.OpGet(cleaningKey)).
+			Commit()
+		if err != nil {
+			return false, models.ProjectLock{}, fmt.Errorf("acquiring project lock: %w", err)
+		}
+		if resp.Succeeded {
+			return true, lock, nil
+		}
+
+		// Classify the failure. If a lock exists, return the current holder; if a
+		// cleaning is in progress, fail closed; otherwise the lifecycle changed
+		// under us and we retry (the next read sees closed → refuse, or a new open
+		// revision → retry the acquire).
+		lockKvs := resp.Responses[0].GetResponseRange().Kvs
+		if len(lockKvs) > 0 {
+			var current models.ProjectLock
+			if err := decodeValue(lockKvs[0].Value, lockRecordKind, lockRecordV1, lockRecordV1, &current); err != nil {
+				return false, models.ProjectLock{}, err
+			}
+			return false, current, nil
+		}
+		if len(resp.Responses[1].GetResponseRange().Kvs) > 0 {
+			return false, models.ProjectLock{}, errPullCleaning
+		}
 	}
-	var current models.ProjectLock
-	if err := decodeValue(getLock.Kvs[0].Value, lockRecordKind, lockRecordV1, lockRecordV1, &current); err != nil {
-		return false, models.ProjectLock{}, err
-	}
-	return false, current, nil
+	return false, models.ProjectLock{}, errors.New("project lock acquisition lost too many lifecycle races")
 }
 
 // errPullCleaning is returned when a project lock cannot be acquired because the
 // pull is being cleaned up. Callers treat it as fail-closed.
 var errPullCleaning = errors.New("pull is being cleaned up; project lock acquisition is refused")
+
+// errPullClosed is returned when a project lock cannot be acquired because the
+// pull's lifecycle is closed. It is cleared when the pull is reopened.
+var errPullClosed = errors.New("pull is closed; project lock acquisition is refused until it is reopened")
+
+// readLifecycle reads a pull's lifecycle record. An absent record is treated as
+// open with revision 0 (so the acquire transaction's ModRevision==0 guard means
+// "still absent"). It returns the record, its state, and its mod revision.
+func (s *scopedLockStore) readLifecycle(ctx context.Context, lifecycleKey string) (lifecycleRecord, LifecycleState, int64, error) {
+	resp, err := s.kv.Get(ctx, lifecycleKey)
+	if err != nil {
+		return lifecycleRecord{}, "", 0, fmt.Errorf("reading pull lifecycle: %w", err)
+	}
+	if len(resp.Kvs) == 0 {
+		return lifecycleRecord{State: LifecycleOpen}, LifecycleOpen, 0, nil
+	}
+	var rec lifecycleRecord
+	if err := decodeValue(resp.Kvs[0].Value, lifecycleRecordKind, lifecycleRecordV1, lifecycleRecordV1, &rec); err != nil {
+		return lifecycleRecord{}, "", 0, err
+	}
+	return rec, rec.State, resp.Kvs[0].ModRevision, nil
+}
+
+// ReopenProjectPull advances a closed pull's lifecycle back to open, bumping its
+// generation, so a reopened pull request accepts new project locks again. It is a
+// no-op (and cheap) when the pull is not closed (design §450). The transition is
+// compare-and-swap on the lifecycle record's revision.
+func (s *scopedLockStore) ReopenProjectPull(ctx context.Context, scope PullScope) error {
+	lifecycleKey := s.keys.PullLifecycleKey(scope)
+	rec, state, rev, err := s.readLifecycle(ctx, lifecycleKey)
+	if err != nil {
+		return err
+	}
+	if state != LifecycleClosed {
+		return nil
+	}
+	next := lifecycleRecord{State: LifecycleOpen, Generation: rec.Generation + 1}
+	val, err := encodeValue(lifecycleRecordKind, lifecycleRecordV1, next)
+	if err != nil {
+		return err
+	}
+	resp, err := s.kv.Txn(ctx).
+		If(clientv3.Compare(clientv3.ModRevision(lifecycleKey), "=", rev)).
+		Then(clientv3.OpPut(lifecycleKey, string(val))).
+		Commit()
+	if err != nil {
+		return fmt.Errorf("reopening pull lifecycle: %w", err)
+	}
+	// A lost CAS means another writer transitioned it concurrently; that writer's
+	// state stands (open on reopen, or a fresh close). Either way, no error.
+	_ = resp
+	return nil
+}
 
 // GetProjectLock returns the lock at scope, or nil if absent.
 func (s *scopedLockStore) GetProjectLock(ctx context.Context, scope ProjectScope) (*models.ProjectLock, error) {
@@ -300,7 +382,13 @@ func (s *scopedLockStore) finishCleaning(ctx context.Context, scope PullScope, c
 	if closeGen {
 		state = LifecycleClosed
 	}
-	val, err := encodeValue(lifecycleRecordKind, lifecycleRecordV1, lifecycleRecord{State: state})
+	// Preserve a monotonic generation across transitions so a delayed delivery
+	// from a prior open/closed cycle can be distinguished from the current one.
+	prev, _, _, err := s.readLifecycle(ctx, s.keys.PullLifecycleKey(scope))
+	if err != nil {
+		return err
+	}
+	val, err := encodeValue(lifecycleRecordKind, lifecycleRecordV1, lifecycleRecord{State: state, Generation: prev.Generation + 1})
 	if err != nil {
 		return err
 	}

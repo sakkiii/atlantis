@@ -6,6 +6,7 @@ package etcd_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sync"
 	"testing"
@@ -14,6 +15,17 @@ import (
 	"github.com/runatlantis/atlantis/server/core/etcd"
 	. "github.com/runatlantis/atlantis/testing"
 )
+
+// inlineExecutor runs an arbitrary function on Register, for tests that need to
+// drive coordinator.Execute with a custom run closure.
+type inlineExecutor struct {
+	fn func(cmd etcd.Command)
+}
+
+func (e *inlineExecutor) Register(_ context.Context, cmd etcd.Command) error {
+	go e.fn(cmd)
+	return nil
+}
 
 // coordExecutor mimics the real command router's executor: on Register it drives
 // the coordinator's Execute in a goroutine, running a recorded closure.
@@ -190,4 +202,62 @@ func TestCoordinator_ExecuteBlockedByOlderGeneration(t *testing.T) {
 	outcome := coord.Execute(blockedCmd, func() bool { ran = true; return true })
 	Equals(t, etcd.ExecuteBlocked, outcome)
 	Assert(t, !ran, "a blocked execution must not run the command")
+}
+
+// TestCoordinator_LeaseLostDuringRunFencesUncertain proves that if the ownership
+// lease is lost while a command runs, Execute leaves the barrier in place
+// (blocking a new owner generation) and marks the command uncertain rather than
+// clearing the fence.
+func TestCoordinator_LeaseLostDuringRunFencesUncertain(t *testing.T) {
+	backend := startEmbeddedEtcd(t)
+	keys := etcd.NewKeyspace("/atlantis")
+	ctx := context.Background()
+	epoch, err := etcd.InitOrValidateNamespace(ctx, backend.Client().KV, keys, "dep-1")
+	Ok(t, err)
+
+	rt, err := etcd.NewRuntime(ctx, runtimeConfig(t, backend, "A", "http://127.0.0.1:4142"))
+	Ok(t, err)
+	t.Cleanup(func() { _ = rt.Close() })
+	coord := etcd.NewRuntimeCoordinator(rt)
+
+	outcomeCh := make(chan etcd.ExecuteOutcome, 1)
+	exec := &inlineExecutor{fn: func(cmd etcd.Command) {
+		outcomeCh <- coord.Execute(cmd, func() bool {
+			// Simulate losing the ownership lease mid-run.
+			_ = rt.Ownership().Close()
+			select {
+			case <-rt.Ownership().Done():
+			case <-time.After(5 * time.Second):
+			}
+			return true
+		})
+	}}
+	rt.AttachExecutor(exec)
+
+	_, err = rt.Route(ctx, cmd("d1"))
+	Ok(t, err)
+
+	select {
+	case o := <-outcomeCh:
+		Equals(t, etcd.ExecuteUncertain, o)
+	case <-time.After(15 * time.Second):
+		t.Fatal("timed out waiting for Execute")
+	}
+
+	// The admission record must be uncertain, never terminal-success.
+	rec, err := rt.Admission().Get(ctx, cmd("d1").Identity)
+	Ok(t, err)
+	Assert(t, rec != nil && rec.State() == etcd.AdmissionUncertain, "admission should be uncertain after lease loss")
+
+	// The barrier remained as a fence: a new owner generation is blocked.
+	own2, err := etcd.NewOwnershipStore(backend, keys, epoch, "B", "http://127.0.0.1:4143", 10*time.Second, 5*time.Second)
+	Ok(t, err)
+	t.Cleanup(func() { _ = own2.Close() })
+	scope := etcd.PullScope{VCSHostname: "github.com", Repository: "o/r", PullNum: 1}
+	newClaim, won, err := own2.Claim(ctx, scope)
+	Ok(t, err)
+	Assert(t, won, "B should win the claim after A's lease dropped")
+	barriers2 := etcd.NewExecutionBarrierStore(backend, keys, epoch, own2.InstanceID())
+	_, err = barriers2.StartStep(ctx, newClaim, "new-exec")
+	Assert(t, errors.Is(err, etcd.ErrBlockedByOlderGeneration()), "a new owner must be blocked by the uncertain barrier")
 }
