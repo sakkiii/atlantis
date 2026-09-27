@@ -37,4 +37,7 @@ tmp-CHANGELOG.md
 test-results/
 
 #Cursor dirs
-.cursor
+.cursor/*
+# Keep the Cloud Agent development environment config under version control.
+!.cursor/environment.json
+!.cursor/install.sh
